@@ -1,0 +1,82 @@
+// Task dispatch control-plane API.
+//
+// The Go execution-engine is a dispatcher: Python Web triggers RPCs here, the
+// engine persists execution records and publishes tasks to RabbitMQ. Worker
+// machines consume from MQ and call Python Web back to update final status.
+// This proto only models the dispatch surface, not the execution status machine.
+syntax = "proto3";
+
+package taskexecution.v1;
+
+option go_package = "execution-engine/api/gen/taskexecution/v1;taskexecutionv1";
+
+service TaskExecutionService {
+  // Single-case dispatch: create record + publish MQ + write back WAIT/FAILED.
+  rpc ExecuteCase(ExecuteCaseRequest) returns (ExecuteCaseResponse);
+
+  // Dispatch all cases of a version in chunks of BATCH_SIZE; one progress
+  // frame per completed chunk. Chunk arrival order is NOT guaranteed because
+  // chunks are dispatched in parallel by N worker goroutines.
+  rpc ExecuteAllCases(ExecuteAllCasesRequest) returns (stream BatchDispatchProgress);
+
+  // Dispatch cases of a (channel, version) pair; same streaming semantics.
+  rpc ExecuteChannelCases(ExecuteChannelCasesRequest) returns (stream BatchDispatchProgress);
+}
+
+// DispatchStatus represents the OUTCOME OF DISPATCH ONLY, not the final
+// execution result. WAIT means MQ publish+confirm succeeded; FAILED means
+// dispatch itself failed. Worker-side execution results (SUCCESS/FAILED etc)
+// are written back to Python Web, outside of this engine.
+enum DispatchStatus {
+  DISPATCH_STATUS_UNSPECIFIED = 0;
+  DISPATCH_STATUS_WAIT        = 1;
+  DISPATCH_STATUS_FAILED      = 2;
+}
+
+message ExecuteCaseRequest {
+  int64  case_id = 1;
+  string version = 2;
+  string user    = 3;
+}
+
+message ExecuteCaseResponse {
+  int64          execution_id = 1;
+  DispatchStatus status       = 2;
+}
+
+message ExecuteAllCasesRequest {
+  string version = 1;
+  string user    = 2;
+}
+
+message ExecuteChannelCasesRequest {
+  string channel = 1;
+  string version = 2;
+  string user    = 3;
+}
+
+// Per-chunk progress frame. The server emits one frame per completed chunk.
+message BatchDispatchProgress {
+  // Index assigned by the producer when it sliced the chunk off the cursor.
+  // Arrival order is NOT guaranteed to equal chunk_index.
+  int32 chunk_index = 1;
+
+  // Number of cases planned in this chunk.
+  int32 chunk_size = 2;
+
+  // Execution IDs whose MQ publish was confirmed.
+  repeated int64 success_execution_ids = 3;
+
+  // Execution IDs whose MQ publish failed (nack/timeout/channel error).
+  repeated int64 failed_execution_ids = 4;
+
+  // Aggregated count of successfully dispatched execution records so far.
+  int32 total_dispatched = 5;
+
+  // Total planned count. Computed once via COUNT(*) before streaming starts.
+  int32 total_planned = 6;
+
+  // Set when the chunk failed as a whole (e.g. DB transaction error or MQ
+  // connection error before any per-task confirm).
+  string chunk_error = 7;
+}
