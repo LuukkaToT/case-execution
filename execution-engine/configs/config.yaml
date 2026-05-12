@@ -3,13 +3,13 @@ server:
   max_recv_msg_mb: 16
 
 mysql:
-  dsn: "root:root@tcp(127.0.0.1:3306)/case_execution?parseTime=true&charset=utf8mb4&loc=Local"
+  dsn: "root:123456@tcp(127.0.0.1:3307)/case_execution?parseTime=true&charset=utf8mb4&loc=Local"
   max_open_conns: 50
   max_idle_conns: 10
   conn_max_lifetime_sec: 3600
 
 rabbitmq:
-  url: "amqp://guest:guest@127.0.0.1:5672/"
+  url: "amqp://practice:practice@127.0.0.1:5673/"
   exchange: "ut.exec"
   channel_pool: 8               # *amqp.Channel 池大小, 应 >= dispatch.worker_count
   confirm_timeout_ms: 5000

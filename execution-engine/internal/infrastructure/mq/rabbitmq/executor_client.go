@@ -577,15 +577,19 @@ func (c *Client) BatchRun(ctx context.Context, tasks []entity.ExecutionTask) (vo
 		seq2id[seq] = t.ExecutionID
 	}
 
+	// Build publishedIDs BEFORE waitConfirms, because waitConfirms drains
+	// seq2id by deleting confirmed entries; using it afterwards would give
+	// an empty set and incorrectly mark every task as failed.
+	publishedIDs := make(map[int64]struct{}, len(seq2id))
+	for _, id := range seq2id {
+		publishedIDs[id] = struct{}{}
+	}
+
 	// Collect confirms for every successfully enqueued publish.
 	success, failed := c.waitConfirms(ctx, pc, seq2id)
 
 	// Tasks that never made it into seq2id (marshal error or publish abort)
 	// must be flagged as failed in the result.
-	publishedIDs := make(map[int64]struct{}, len(seq2id))
-	for _, id := range seq2id {
-		publishedIDs[id] = struct{}{}
-	}
 	for _, t := range tasks {
 		if _, ok := publishedIDs[t.ExecutionID]; !ok {
 			failed = append(failed, t.ExecutionID)
