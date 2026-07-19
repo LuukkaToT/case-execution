@@ -20,7 +20,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// toGRPCErr — pure function, table-driven
+// toGRPCErr：纯函数表驱动测试
 // ---------------------------------------------------------------------------
 
 func TestToGRPCErr(t *testing.T) {
@@ -55,7 +55,7 @@ func TestToGRPCErr(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// toPbDispatchStatus — pure function, table-driven
+// toPbDispatchStatus：纯函数表驱动测试
 // ---------------------------------------------------------------------------
 
 func TestToPbDispatchStatus(t *testing.T) {
@@ -75,7 +75,7 @@ func TestToPbDispatchStatus(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Handler.ExecuteCase — request validation
+// Handler.ExecuteCase：请求校验
 // ---------------------------------------------------------------------------
 
 func TestHandlerExecuteCase_NilRequest(t *testing.T) {
@@ -107,10 +107,11 @@ func TestHandlerExecuteCase_ValidRequest(t *testing.T) {
 	require.NotNil(t, resp)
 	assert.Greater(t, resp.ExecutionId, int64(0))
 	assert.Equal(t, pb.DispatchStatus_DISPATCH_STATUS_WAIT, resp.Status)
+	assert.NotEmpty(t, resp.RequestId)
 }
 
 // ---------------------------------------------------------------------------
-// Minimal fakes wired to build a real DispatchAppService for handler tests
+// 使用最小测试替身装配真实 DispatchAppService，供 handler 测试使用
 // ---------------------------------------------------------------------------
 
 type handlerFakeTxRunner struct{}

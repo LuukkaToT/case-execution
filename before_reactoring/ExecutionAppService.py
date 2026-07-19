@@ -157,7 +157,7 @@ class ExecutionAppService:
             with session_scope() as session:
                 self.set_session(session)
 
-                # 调用 Repo
+                # 调用仓储
                 data_list, total = self.execution_repo.query_executions(
                     offset=offset,
                     limit=limit,

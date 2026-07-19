@@ -1,4 +1,4 @@
-// Package repository declares persistence ports for the domain.
+// Package repository 定义领域层所需的持久化端口。
 package repository
 
 import (
@@ -7,28 +7,23 @@ import (
 	"execution-engine/internal/domain/entity"
 )
 
-// ExecutionRepository persists ExecutionRecord aggregates.
+// ExecutionRepository 负责持久化 ExecutionRecord 聚合。
 //
-// Transactions: implementations must respect a transactional *gorm.DB held
-// in ctx (see infrastructure/persistence/mysql.WithTx). A method called with
-// a non-transactional ctx opens its own short-lived transaction implicitly
-// via gorm's WithContext.
+// 实现必须识别 ctx 中携带的事务句柄，详见 mysql.WithTx；未携带事务时，
+// 仓储通过 gorm.WithContext 使用根连接池执行独立数据库操作。
 type ExecutionRepository interface {
-	// Add inserts a single record and back-fills ExecutionID in place.
+	// Add 插入单条记录，并原地回填 ExecutionID。
 	Add(ctx context.Context, record *entity.ExecutionRecord) error
 
-	// BatchAdd inserts records in efficient batches and back-fills each
-	// ExecutionID in place.
+	// BatchAdd 高效批量插入记录，并原地回填各自的 ExecutionID。
 	BatchAdd(ctx context.Context, records []*entity.ExecutionRecord) error
 
-	// FindByID returns nil, nil when the id is absent (not an error; this
-	// matches the semantic of the Python adapter returning None).
+	// FindByID 在记录不存在时返回 nil, nil，与 Python 适配器返回 None 的语义一致。
 	FindByID(ctx context.Context, executionID int64) (*entity.ExecutionRecord, error)
 
-	// Save persists mutable fields (status, execute_at, finish_at).
+	// Save 持久化 status、execute_at、finish_at 等可变字段。
 	Save(ctx context.Context, record *entity.ExecutionRecord) error
 
-	// BatchUpdateStatus updates status only, grouped by target status to
-	// keep the SQL count bounded (two statuses -> two UPDATE statements).
+	// BatchUpdateStatus 按目标状态分组持久化下发状态和终态时间，限制 SQL 数量。
 	BatchUpdateStatus(ctx context.Context, records []*entity.ExecutionRecord) error
 }

@@ -1,4 +1,4 @@
-// Package logger provides a thin wrapper over zap, used across the engine.
+// Package logger 对 zap 做轻量封装，供整个执行引擎统一使用。
 package logger
 
 import (
@@ -13,13 +13,13 @@ var (
 	logger *zap.Logger
 )
 
-// Config controls log output.
+// Config 控制日志输出格式和级别。
 type Config struct {
 	Level    string
 	Encoding string
 }
 
-// Init initializes the global logger. Safe to call once.
+// Init 初始化全局日志器，应在进程启动时调用一次。
 func Init(cfg Config) error {
 	var err error
 	once.Do(func() {
@@ -49,7 +49,7 @@ func Init(cfg Config) error {
 	return err
 }
 
-// L returns the global logger. Falls back to a no-op logger before Init.
+// L 返回全局日志器；Init 调用前返回空操作日志器。
 func L() *zap.Logger {
 	if logger == nil {
 		return zap.NewNop()
@@ -57,7 +57,7 @@ func L() *zap.Logger {
 	return logger
 }
 
-// Sync flushes buffered log entries; call on shutdown.
+// Sync 刷新缓冲区中的日志，应在进程退出前调用。
 func Sync() {
 	if logger != nil {
 		_ = logger.Sync()

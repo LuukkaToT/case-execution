@@ -71,7 +71,7 @@ func TestDispatchBatch_Mixed(t *testing.T) {
 func TestDispatchBatch_UnknownIDUnchanged(t *testing.T) {
 	svc := New()
 	records := makeRecords(2)
-	// Neither ID appears in the result partitions.
+	// 两条记录的 ID 都不在结果分区中。
 	result := vo.BatchResult{SuccessIDs: []int64{99}, FailedIDs: []int64{100}}
 	svc.DispatchBatch(records, result)
 	for _, r := range records {
@@ -79,7 +79,7 @@ func TestDispatchBatch_UnknownIDUnchanged(t *testing.T) {
 	}
 }
 
-// makeRecords creates n ExecutionRecords with sequential ExecutionIDs starting at 1.
+// makeRecords 创建 n 条 ExecutionRecord，ExecutionID 从 1 开始递增。
 func makeRecords(n int) []*entity.ExecutionRecord {
 	records := make([]*entity.ExecutionRecord, n)
 	for i := 0; i < n; i++ {

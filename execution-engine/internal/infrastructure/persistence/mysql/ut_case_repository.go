@@ -13,18 +13,17 @@ import (
 	"gorm.io/gorm"
 )
 
-// UtCaseRepository reads the ut_case catalogue. Writes happen upstream and
-// are not modelled here.
+// UtCaseRepository 读取 ut_case 用例目录，写入由上游负责，本引擎不建模。
 type UtCaseRepository struct {
 	root *gorm.DB
 }
 
-// NewUtCaseRepository constructs a repository bound to root.
+// NewUtCaseRepository 创建绑定根数据库句柄的仓储。
 func NewUtCaseRepository(root *gorm.DB) repository.UtCaseRepository {
 	return &UtCaseRepository{root: root}
 }
 
-// FindByID returns nil, nil when the id is absent.
+// FindByID 在记录不存在时返回 nil, nil。
 func (r *UtCaseRepository) FindByID(ctx context.Context, caseID int64) (*entity.UtCase, error) {
 	db := FromCtx(ctx, r.root)
 	var row po.UtCase
@@ -38,8 +37,7 @@ func (r *UtCaseRepository) FindByID(ctx context.Context, caseID int64) (*entity.
 	return row.ToEntity(), nil
 }
 
-// CountByVersion returns the row count; used by the batch RPC to populate
-// total_planned in the progress stream.
+// CountByVersion 返回指定版本的记录数，用于填充批量 RPC 进度中的 total_planned。
 func (r *UtCaseRepository) CountByVersion(ctx context.Context, v vo.Version) (int64, error) {
 	db := FromCtx(ctx, r.root)
 	var n int64
@@ -49,7 +47,7 @@ func (r *UtCaseRepository) CountByVersion(ctx context.Context, v vo.Version) (in
 	return n, nil
 }
 
-// CountByChannelVersion is the (channel, version) variant.
+// CountByChannelVersion 返回指定渠道和版本的记录数。
 func (r *UtCaseRepository) CountByChannelVersion(ctx context.Context, ch vo.Channel, v vo.Version) (int64, error) {
 	db := FromCtx(ctx, r.root)
 	var n int64
@@ -61,9 +59,8 @@ func (r *UtCaseRepository) CountByChannelVersion(ctx context.Context, ch vo.Chan
 	return n, nil
 }
 
-// ScanByVersion walks the catalogue via gorm.FindInBatches, which internally
-// paginates by primary key range - no full load into memory and no server-side
-// cursor to babysit.
+// ScanByVersion 使用 gorm.FindInBatches 按主键范围分页遍历目录，无需一次性
+// 加载全部数据，也不需要维护服务端游标。
 func (r *UtCaseRepository) ScanByVersion(
 	ctx context.Context, v vo.Version, size int,
 	fn repository.UtCaseScanFn,
@@ -73,7 +70,7 @@ func (r *UtCaseRepository) ScanByVersion(
 	})
 }
 
-// ScanByChannelVersion is the (channel, version) variant.
+// ScanByChannelVersion 是按渠道和版本过滤的分页扫描。
 func (r *UtCaseRepository) ScanByChannelVersion(
 	ctx context.Context, ch vo.Channel, v vo.Version, size int,
 	fn repository.UtCaseScanFn,
@@ -83,11 +80,9 @@ func (r *UtCaseRepository) ScanByChannelVersion(
 	})
 }
 
-// scan is the shared streaming body. Aborting mid-scan is best-effort:
-// FindInBatches will invoke the callback at most once more after ctx cancels
-// because the outer gorm cannot observe ctx between the SQL fetch and the
-// Go callback. The callback itself checks ctx and returns fast, so this
-// extra invocation is harmless.
+// scan 是共用的流式扫描实现。中途取消为尽力而为：ctx 取消后，FindInBatches
+// 最多可能额外调用一次回调，因为 GORM 在 SQL 返回和 Go 回调之间无法立即
+// 感知取消；回调会自行检查 ctx 并快速返回，因此不会继续处理数据。
 func (r *UtCaseRepository) scan(
 	ctx context.Context, size int, fn repository.UtCaseScanFn,
 	where func(*gorm.DB) *gorm.DB,

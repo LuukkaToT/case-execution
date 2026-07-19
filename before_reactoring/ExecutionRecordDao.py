@@ -113,13 +113,13 @@ class ExecutionRecordDao:
         # --- 1. 构建查询主体 ---
         stmt = select(*selected_columns)
 
-        # Count 语句---
+        # 统计语句
         count_stmt = select(func.count()).select_from(ExecutionRecordTable)
 
-        # --- 2. 处理 Join ---
+        # --- 2. 处理关联查询 ---
         if need_join:
             stmt = stmt.join(UtCaseTable, ExecutionRecordTable.case_id == UtCaseTable.case_id)
-            # 注意：如果过滤条件不涉及 UtCaseTable，count_stmt 其实可以不加 join，性能更好。
+            # 注意：如果过滤条件不涉及 UtCaseTable，统计语句可以不做关联，性能更好。
             # 但为了逻辑严谨（防止未来加了跨表过滤），这里保持一致也行。
             count_stmt = count_stmt.join(UtCaseTable, ExecutionRecordTable.case_id == UtCaseTable.case_id)
 
@@ -132,7 +132,7 @@ class ExecutionRecordDao:
             stmt = stmt.where(ExecutionRecordTable.execution_status.in_(execution_status))
             count_stmt = count_stmt.where(ExecutionRecordTable.execution_status.in_(execution_status))
 
-        # 执行 Count
+        # 执行统计
         total = self._session.scalar(count_stmt) or 0
 
         # --- 4. 排序 ---

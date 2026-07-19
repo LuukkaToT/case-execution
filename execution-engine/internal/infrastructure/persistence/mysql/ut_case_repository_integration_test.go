@@ -5,7 +5,9 @@ package mysql
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"execution-engine/internal/domain/entity"
 	"execution-engine/internal/domain/vo"
@@ -15,18 +17,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// insertUtCaseFixtures writes po.UtCase rows into the same transaction carried
-// by ctx so they are rolled back automatically at test cleanup.
+var (
+	testCaseIDBase = time.Now().UnixMilli() * 1000
+	testRunPrefix  = fmt.Sprintf("it-%d-", time.Now().UnixNano())
+)
+
+func integrationCaseID(id int64) int64 { return testCaseIDBase + id }
+
+func integrationVersion(version string) vo.Version {
+	return vo.Version(testRunPrefix + version)
+}
+
+// insertUtCaseFixtures 将 po.UtCase 测试数据写入 ctx 携带的同一事务，
+// 以便测试清理阶段自动回滚。
 func insertUtCaseFixtures(t *testing.T, ctx context.Context, rows []po.UtCase) {
 	t.Helper()
 	db := FromCtx(ctx, testDB)
 	for i := range rows {
+		rows[i].CaseID = integrationCaseID(rows[i].CaseID)
+		rows[i].Version = string(integrationVersion(rows[i].Version))
 		require.NoError(t, db.Create(&rows[i]).Error)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// FindByID
+// 按编号查询
 // ---------------------------------------------------------------------------
 
 func TestUtCaseRepository_FindByID_Found(t *testing.T) {
@@ -36,12 +51,12 @@ func TestUtCaseRepository_FindByID_Found(t *testing.T) {
 	})
 
 	repo := NewUtCaseRepository(testDB)
-	got, err := repo.FindByID(ctx, 10001)
+	got, err := repo.FindByID(ctx, integrationCaseID(10001))
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	assert.Equal(t, int64(10001), got.CaseID)
+	assert.Equal(t, integrationCaseID(10001), got.CaseID)
 	assert.Equal(t, "Alpha", got.CaseName)
-	assert.Equal(t, vo.Version("v1.0"), got.Version)
+	assert.Equal(t, integrationVersion("v1.0"), got.Version)
 	assert.Equal(t, vo.Channel("ios"), got.Channel)
 }
 
@@ -55,7 +70,7 @@ func TestUtCaseRepository_FindByID_NotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// CountByVersion
+// 按版本计数
 // ---------------------------------------------------------------------------
 
 func TestUtCaseRepository_CountByVersion(t *testing.T) {
@@ -68,13 +83,13 @@ func TestUtCaseRepository_CountByVersion(t *testing.T) {
 	})
 
 	repo := NewUtCaseRepository(testDB)
-	n, err := repo.CountByVersion(ctx, vo.Version("v1.0"))
+	n, err := repo.CountByVersion(ctx, integrationVersion("v1.0"))
 	require.NoError(t, err)
 	assert.Equal(t, int64(3), n)
 }
 
 // ---------------------------------------------------------------------------
-// CountByChannelVersion
+// 按渠道与版本计数
 // ---------------------------------------------------------------------------
 
 func TestUtCaseRepository_CountByChannelVersion(t *testing.T) {
@@ -86,13 +101,13 @@ func TestUtCaseRepository_CountByChannelVersion(t *testing.T) {
 	})
 
 	repo := NewUtCaseRepository(testDB)
-	n, err := repo.CountByChannelVersion(ctx, vo.Channel("ios"), vo.Version("v1.0"))
+	n, err := repo.CountByChannelVersion(ctx, vo.Channel("ios"), integrationVersion("v1.0"))
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), n)
 }
 
 // ---------------------------------------------------------------------------
-// ScanByVersion
+// 按版本游标扫描
 // ---------------------------------------------------------------------------
 
 func TestUtCaseRepository_ScanByVersion(t *testing.T) {
@@ -106,19 +121,19 @@ func TestUtCaseRepository_ScanByVersion(t *testing.T) {
 	repo := NewUtCaseRepository(testDB)
 	var collected []*entity.UtCase
 	var batchCalls int
-	err := repo.ScanByVersion(ctx, vo.Version("vscan"), 2, func(batch []*entity.UtCase) error {
+	err := repo.ScanByVersion(ctx, integrationVersion("vscan"), 2, func(batch []*entity.UtCase) error {
 		batchCalls++
 		collected = append(collected, batch...)
 		return nil
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 3, len(collected))
-	// batchSize=2, 3 rows → 2 callbacks (2 then 1)
+	// batchSize=2，3 行数据应触发 2 次回调（先 2 行，再 1 行）。
 	assert.Equal(t, 2, batchCalls)
 }
 
 // ---------------------------------------------------------------------------
-// ScanByChannelVersion
+// 按渠道与版本游标扫描
 // ---------------------------------------------------------------------------
 
 func TestUtCaseRepository_ScanByChannelVersion(t *testing.T) {
@@ -131,7 +146,7 @@ func TestUtCaseRepository_ScanByChannelVersion(t *testing.T) {
 
 	repo := NewUtCaseRepository(testDB)
 	var collected []*entity.UtCase
-	err := repo.ScanByChannelVersion(ctx, vo.Channel("ios"), vo.Version("vch"), 100, func(batch []*entity.UtCase) error {
+	err := repo.ScanByChannelVersion(ctx, vo.Channel("ios"), integrationVersion("vch"), 100, func(batch []*entity.UtCase) error {
 		collected = append(collected, batch...)
 		return nil
 	})
@@ -143,7 +158,7 @@ func TestUtCaseRepository_ScanByChannelVersion(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ScanByVersion — early abort via fn error
+// 按版本扫描：回调返回错误时提前终止
 // ---------------------------------------------------------------------------
 
 func TestUtCaseRepository_ScanByVersion_AbortOnFnError(t *testing.T) {
@@ -155,7 +170,7 @@ func TestUtCaseRepository_ScanByVersion_AbortOnFnError(t *testing.T) {
 
 	repo := NewUtCaseRepository(testDB)
 	var calls int
-	err := repo.ScanByVersion(ctx, vo.Version("vabort"), 1, func(_ []*entity.UtCase) error {
+	err := repo.ScanByVersion(ctx, integrationVersion("vabort"), 1, func(_ []*entity.UtCase) error {
 		calls++
 		return errors.New("abort early")
 	})

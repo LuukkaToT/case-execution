@@ -1,9 +1,9 @@
-// Task dispatch control-plane API.
+// 用例下发控制面接口。
 //
-// The Go execution-engine is a dispatcher: Python Web triggers RPCs here, the
-// engine persists execution records and publishes tasks to RabbitMQ. Worker
-// machines consume from MQ and call Python Web back to update final status.
-// This proto only models the dispatch surface, not the execution status machine.
+// Python Web 负责业务入口，并通过 gRPC 调用 Go execution-engine。引擎负责
+// 查询用例、持久化执行记录并向 RabbitMQ 批量投递任务；执行机消费任务后，
+// 仍然回调 Python Web 更新最终状态。本协议只描述下发能力，不接管完整的
+// 用例执行状态机。
 syntax = "proto3";
 
 package taskexecution.v1;
@@ -11,22 +11,20 @@ package taskexecution.v1;
 option go_package = "execution-engine/api/gen/taskexecution/v1;taskexecutionv1";
 
 service TaskExecutionService {
-  // Single-case dispatch: create record + publish MQ + write back WAIT/FAILED.
+  // 单用例下发：创建执行记录、发布 MQ，并回写 WAIT/FAILED 状态。
   rpc ExecuteCase(ExecuteCaseRequest) returns (ExecuteCaseResponse);
 
-  // Dispatch all cases of a version in chunks of BATCH_SIZE; one progress
-  // frame per completed chunk. Chunk arrival order is NOT guaranteed because
-  // chunks are dispatched in parallel by N worker goroutines.
+  // 按 BATCH_SIZE 分片下发指定版本的全部用例；每完成一个分片返回一帧进度。
+  // 多个 worker goroutine 并行处理，因此进度帧不保证按分片编号到达。
   rpc ExecuteAllCases(ExecuteAllCasesRequest) returns (stream BatchDispatchProgress);
 
-  // Dispatch cases of a (channel, version) pair; same streaming semantics.
+  // 下发指定渠道和版本的用例，流式返回语义与全量下发相同。
   rpc ExecuteChannelCases(ExecuteChannelCasesRequest) returns (stream BatchDispatchProgress);
 }
 
-// DispatchStatus represents the OUTCOME OF DISPATCH ONLY, not the final
-// execution result. WAIT means MQ publish+confirm succeeded; FAILED means
-// dispatch itself failed. Worker-side execution results (SUCCESS/FAILED etc)
-// are written back to Python Web, outside of this engine.
+// DispatchStatus 只表示“下发结果”，不表示用例最终执行结果。WAIT 表示消息已
+// 成功发布并收到确认，FAILED 表示下发失败。SUCCESS/FAILED 等执行机结果仍
+// 由执行机回调 Python Web 写入，不属于本引擎职责。
 enum DispatchStatus {
   DISPATCH_STATUS_UNSPECIFIED = 0;
   DISPATCH_STATUS_WAIT        = 1;
@@ -37,46 +35,57 @@ message ExecuteCaseRequest {
   int64  case_id = 1;
   string version = 2;
   string user    = 3;
+
+  // 幂等请求标识；客户端重试同一次下发时必须复用。
+  string request_id = 4;
 }
 
 message ExecuteCaseResponse {
   int64          execution_id = 1;
   DispatchStatus status       = 2;
+  string         request_id   = 3;
 }
 
 message ExecuteAllCasesRequest {
   string version = 1;
   string user    = 2;
+
+  // 幂等请求标识；客户端重试同一次下发时必须复用。
+  string request_id = 3;
 }
 
 message ExecuteChannelCasesRequest {
   string channel = 1;
   string version = 2;
   string user    = 3;
+
+  // 幂等请求标识；客户端重试同一次下发时必须复用。
+  string request_id = 4;
 }
 
-// Per-chunk progress frame. The server emits one frame per completed chunk.
+// 分片进度帧；服务端每完成一个分片发送一帧。
 message BatchDispatchProgress {
-  // Index assigned by the producer when it sliced the chunk off the cursor.
-  // Arrival order is NOT guaranteed to equal chunk_index.
+  // 生产者从游标切分数据时分配的编号；到达顺序不保证等于该编号顺序。
   int32 chunk_index = 1;
 
-  // Number of cases planned in this chunk.
+  // 当前分片计划下发的用例数。
   int32 chunk_size = 2;
 
-  // Execution IDs whose MQ publish was confirmed.
+  // 已收到 MQ 发布确认的执行记录 ID。
   repeated int64 success_execution_ids = 3;
 
-  // Execution IDs whose MQ publish failed (nack/timeout/channel error).
+  // MQ 发布失败的执行记录 ID，包括 nack、超时和 channel 异常。
   repeated int64 failed_execution_ids = 4;
 
-  // Aggregated count of successfully dispatched execution records so far.
+  // 当前已经成功下发的执行记录累计数。
   int32 total_dispatched = 5;
 
-  // Total planned count. Computed once via COUNT(*) before streaming starts.
+  // 计划下发总数，在流式处理开始前通过 COUNT(*) 计算一次。
   int32 total_planned = 6;
 
-  // Set when the chunk failed as a whole (e.g. DB transaction error or MQ
-  // connection error before any per-task confirm).
+  // 分片整体异常信息，例如数据库事务错误，或尚未收到逐条确认时 MQ 连接断开。
   string chunk_error = 7;
+
+  // 幂等请求标识；客户端重试时必须复用同一个值。
+  string request_id = 8;
 }

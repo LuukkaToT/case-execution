@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -17,17 +18,17 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Fakes
+// 测试替身
 // ---------------------------------------------------------------------------
 
-// fakeTxRunner executes fn directly with no real DB transaction.
+// fakeTxRunner 直接执行 fn，不开启真实数据库事务。
 type fakeTxRunner struct{}
 
 func (f *fakeTxRunner) Do(ctx context.Context, fn func(context.Context) error) error {
 	return fn(ctx)
 }
 
-// fakeUtCaseRepo holds a fixed set of UtCases for FindByID, Count and Scan.
+// fakeUtCaseRepo 保存固定用例集合，用于 FindByID、Count 和 Scan 测试。
 type fakeUtCaseRepo struct {
 	cases  map[int64]*entity.UtCase
 	scanFn func(fn repository.UtCaseScanFn) error
@@ -67,17 +68,36 @@ func (f *fakeUtCaseRepo) ScanByChannelVersion(_ context.Context, _ vo.Channel, _
 	return f.ScanByVersion(context.Background(), "", 0, fn)
 }
 
-// fakeExecRepo stores records in memory and assigns auto-increment IDs.
+// fakeExecRepo 在内存中保存执行记录并分配自增 ID。
 type fakeExecRepo struct {
-	nextID  int64
-	records map[int64]*entity.ExecutionRecord
+	mu             sync.Mutex
+	nextID         int64
+	records        map[int64]*entity.ExecutionRecord
+	batchUpdateErr error
 }
 
 func newFakeExecRepo() *fakeExecRepo {
 	return &fakeExecRepo{nextID: 1, records: make(map[int64]*entity.ExecutionRecord)}
 }
 
-func (f *fakeExecRepo) Add(_ context.Context, r *entity.ExecutionRecord) error {
+func (f *fakeExecRepo) Add(ctx context.Context, r *entity.ExecutionRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.add(r)
+}
+
+func (f *fakeExecRepo) add(r *entity.ExecutionRecord) error {
+	if r.RequestID != "" {
+		for _, existing := range f.records {
+			if existing.RequestID == r.RequestID && existing.CaseID == r.CaseID {
+				*r = *existing
+				return nil
+			}
+		}
+	}
 	r.ExecutionID = f.nextID
 	f.nextID++
 	cp := *r
@@ -85,16 +105,26 @@ func (f *fakeExecRepo) Add(_ context.Context, r *entity.ExecutionRecord) error {
 	return nil
 }
 
-func (f *fakeExecRepo) BatchAdd(_ context.Context, records []*entity.ExecutionRecord) error {
+func (f *fakeExecRepo) BatchAdd(ctx context.Context, records []*entity.ExecutionRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, r := range records {
-		if err := f.Add(context.Background(), r); err != nil {
+		if err := f.add(r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (f *fakeExecRepo) FindByID(_ context.Context, id int64) (*entity.ExecutionRecord, error) {
+func (f *fakeExecRepo) FindByID(ctx context.Context, id int64) (*entity.ExecutionRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	r, ok := f.records[id]
 	if !ok {
 		return nil, nil
@@ -103,7 +133,12 @@ func (f *fakeExecRepo) FindByID(_ context.Context, id int64) (*entity.ExecutionR
 	return &cp, nil
 }
 
-func (f *fakeExecRepo) Save(_ context.Context, r *entity.ExecutionRecord) error {
+func (f *fakeExecRepo) Save(ctx context.Context, r *entity.ExecutionRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if _, ok := f.records[r.ExecutionID]; !ok {
 		return errors.New("record not found")
 	}
@@ -112,26 +147,51 @@ func (f *fakeExecRepo) Save(_ context.Context, r *entity.ExecutionRecord) error 
 	return nil
 }
 
-func (f *fakeExecRepo) BatchUpdateStatus(_ context.Context, records []*entity.ExecutionRecord) error {
+func (f *fakeExecRepo) BatchUpdateStatus(ctx context.Context, records []*entity.ExecutionRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.batchUpdateErr != nil {
+		return f.batchUpdateErr
+	}
 	for _, r := range records {
 		if stored, ok := f.records[r.ExecutionID]; ok {
 			stored.ExecutionStatus = r.ExecutionStatus
+			stored.FinishAt = r.FinishAt
 		}
 	}
 	return nil
 }
 
-// fakeExecutor controls whether MQ publish succeeds or fails.
+// fakeExecutor 控制 MQ 发布成功、失败或部分成功。
 type fakeExecutor struct {
-	executeErr  error
-	batchRunErr error
+	executeErr     error
+	executeFn      func(context.Context) error
+	batchRunErr    error
+	batchRunResult *vo.BatchResult
+	batchRunFn     func(context.Context, []entity.ExecutionTask) (vo.BatchResult, error)
+	executeCalls   int32
+	batchRunCalls  int32
 }
 
-func (f *fakeExecutor) Execute(_ context.Context, _ *entity.ExecutionRecord, _ string) error {
+func (f *fakeExecutor) Execute(ctx context.Context, _ *entity.ExecutionRecord, _ string) error {
+	atomic.AddInt32(&f.executeCalls, 1)
+	if f.executeFn != nil {
+		return f.executeFn(ctx)
+	}
 	return f.executeErr
 }
 
-func (f *fakeExecutor) BatchRun(_ context.Context, tasks []entity.ExecutionTask) (vo.BatchResult, error) {
+func (f *fakeExecutor) BatchRun(ctx context.Context, tasks []entity.ExecutionTask) (vo.BatchResult, error) {
+	atomic.AddInt32(&f.batchRunCalls, 1)
+	if f.batchRunFn != nil {
+		return f.batchRunFn(ctx, tasks)
+	}
+	if f.batchRunResult != nil {
+		return *f.batchRunResult, f.batchRunErr
+	}
 	if f.batchRunErr != nil {
 		return vo.BatchResult{}, f.batchRunErr
 	}
@@ -145,7 +205,7 @@ func (f *fakeExecutor) BatchRun(_ context.Context, tasks []entity.ExecutionTask)
 func (f *fakeExecutor) Close(_ context.Context) error { return nil }
 
 // ---------------------------------------------------------------------------
-// Helper
+// 测试辅助函数
 // ---------------------------------------------------------------------------
 
 func newService(caseRepo repository.UtCaseRepository, execRepo repository.ExecutionRepository, executor port.UtCaseExecutorClient) *DispatchAppService {
@@ -160,7 +220,7 @@ func newService(caseRepo repository.UtCaseRepository, execRepo repository.Execut
 }
 
 // ---------------------------------------------------------------------------
-// Config.withDefaults
+// Config.withDefaults 默认值
 // ---------------------------------------------------------------------------
 
 func TestConfigWithDefaults(t *testing.T) {
@@ -176,7 +236,7 @@ func TestConfigWithDefaults_NonZeroUnchanged(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ExecuteCase
+// 单用例下发
 // ---------------------------------------------------------------------------
 
 func TestExecuteCase_EmptyVersion(t *testing.T) {
@@ -228,8 +288,47 @@ func TestExecuteCase_MQFailure(t *testing.T) {
 	assert.Equal(t, vo.StatusFailed, stored.ExecutionStatus)
 }
 
+func TestExecuteCase_ClientCancelAfterPublishStillWritesStatus(t *testing.T) {
+	caseRepo := &fakeUtCaseRepo{cases: map[int64]*entity.UtCase{
+		1: {CaseID: 1, CaseName: "Test1"},
+	}}
+	execRepo := newFakeExecRepo()
+	ctx, cancel := context.WithCancel(context.Background())
+	executor := &fakeExecutor{executeFn: func(context.Context) error {
+		cancel()
+		return nil
+	}}
+	svc := newService(caseRepo, execRepo, executor)
+
+	id, status, err := svc.ExecuteCase(ctx, 1, vo.Version("v1"), "u")
+	require.NoError(t, err)
+	assert.Equal(t, vo.StatusWait, status)
+	stored, findErr := execRepo.FindByID(context.Background(), id)
+	require.NoError(t, findErr)
+	assert.Equal(t, vo.StatusWait, stored.ExecutionStatus)
+}
+
+func TestExecuteCaseWithRequest_重试复用原记录且不重复发布(t *testing.T) {
+	caseRepo := &fakeUtCaseRepo{cases: map[int64]*entity.UtCase{
+		1: {CaseID: 1, CaseName: "Test1"},
+	}}
+	execRepo := newFakeExecRepo()
+	executor := &fakeExecutor{}
+	svc := newService(caseRepo, execRepo, executor)
+
+	firstID, firstStatus, err := svc.ExecuteCaseWithRequest(context.Background(), "req-single-1", 1, vo.Version("v1"), "u")
+	require.NoError(t, err)
+	secondID, secondStatus, err := svc.ExecuteCaseWithRequest(context.Background(), "req-single-1", 1, vo.Version("v1"), "u")
+	require.NoError(t, err)
+
+	assert.Equal(t, firstID, secondID)
+	assert.Equal(t, vo.StatusWait, firstStatus)
+	assert.Equal(t, vo.StatusWait, secondStatus)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&executor.executeCalls))
+}
+
 // ---------------------------------------------------------------------------
-// ExecuteAllCases
+// 全版本批量下发
 // ---------------------------------------------------------------------------
 
 func TestExecuteAllCases_EmptyVersion(t *testing.T) {
@@ -273,8 +372,73 @@ func TestExecuteAllCases_SingleBatchSuccess(t *testing.T) {
 	assert.Empty(t, last.FailedIDs)
 }
 
+func TestExecuteAllCases_PartialPublishErrorPreservesConfirmedIDs(t *testing.T) {
+	caseRepo := &fakeUtCaseRepo{cases: map[int64]*entity.UtCase{
+		1: {CaseID: 1, CaseName: "C1"},
+		2: {CaseID: 2, CaseName: "C2"},
+	}}
+	execRepo := newFakeExecRepo()
+	executor := &fakeExecutor{batchRunFn: func(_ context.Context, tasks []entity.ExecutionTask) (vo.BatchResult, error) {
+		return vo.BatchResult{SuccessIDs: []int64{tasks[0].ExecutionID}}, errors.New("connection closed mid-batch")
+	}}
+	svc := newService(caseRepo, execRepo, executor)
+
+	var progress Progress
+	err := svc.ExecuteAllCases(context.Background(), vo.Version("v1"), "u", func(p Progress) error {
+		progress = p
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Len(t, progress.SuccessIDs, 1)
+	assert.Len(t, progress.FailedIDs, 1)
+	assert.NotEqual(t, progress.SuccessIDs[0], progress.FailedIDs[0])
+	assert.Contains(t, progress.ChunkError, "connection closed")
+
+	succeeded, findErr := execRepo.FindByID(context.Background(), progress.SuccessIDs[0])
+	require.NoError(t, findErr)
+	failed, findErr := execRepo.FindByID(context.Background(), progress.FailedIDs[0])
+	require.NoError(t, findErr)
+	assert.Equal(t, vo.StatusWait, succeeded.ExecutionStatus)
+	assert.Equal(t, vo.StatusFailed, failed.ExecutionStatus)
+}
+
+func TestExecuteAllCases_WriteBackErrorIsVisibleInProgress(t *testing.T) {
+	caseRepo := &fakeUtCaseRepo{cases: map[int64]*entity.UtCase{
+		1: {CaseID: 1, CaseName: "C1"},
+	}}
+	execRepo := newFakeExecRepo()
+	execRepo.batchUpdateErr = errors.New("mysql unavailable")
+	svc := newService(caseRepo, execRepo, &fakeExecutor{})
+
+	var progress Progress
+	err := svc.ExecuteAllCases(context.Background(), vo.Version("v1"), "u", func(p Progress) error {
+		progress = p
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Contains(t, progress.ChunkError, "status write-back failed")
+}
+
+func TestExecuteAllCasesWithRequest_重试不重复批量发布(t *testing.T) {
+	caseRepo := &fakeUtCaseRepo{cases: map[int64]*entity.UtCase{
+		1: {CaseID: 1, CaseName: "C1"},
+		2: {CaseID: 2, CaseName: "C2"},
+	}}
+	execRepo := newFakeExecRepo()
+	executor := &fakeExecutor{}
+	svc := newService(caseRepo, execRepo, executor)
+
+	for i := 0; i < 2; i++ {
+		err := svc.ExecuteAllCasesWithRequest(context.Background(), "req-batch-1", vo.Version("v1"), "u", func(Progress) error {
+			return nil
+		})
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int32(1), atomic.LoadInt32(&executor.batchRunCalls))
+}
+
 // ---------------------------------------------------------------------------
-// ExecuteChannelCases
+// 按渠道和版本批量下发
 // ---------------------------------------------------------------------------
 
 func TestExecuteChannelCases_EmptyChannel(t *testing.T) {
@@ -292,7 +456,7 @@ func TestExecuteChannelCases_EmptyVersion(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// dispatchStream: progress callback error cancels pipeline
+// dispatchStream：进度回调失败时取消整条流水线
 // ---------------------------------------------------------------------------
 
 func TestExecuteAllCases_ProgressCallbackError(t *testing.T) {
@@ -309,7 +473,7 @@ func TestExecuteAllCases_ProgressCallbackError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// extractExecutionIDs helper
+// extractExecutionIDs 辅助函数
 // ---------------------------------------------------------------------------
 
 func TestExtractExecutionIDs(t *testing.T) {
@@ -322,7 +486,7 @@ func TestExtractExecutionIDs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrency: multiple workers emit progress for all chunks
+// 并发场景：多个 worker 为全部分片返回进度
 // ---------------------------------------------------------------------------
 
 func TestExecuteAllCases_MultipleChunks(t *testing.T) {
@@ -335,7 +499,7 @@ func TestExecuteAllCases_MultipleChunks(t *testing.T) {
 	caseRepo := &fakeUtCaseRepo{
 		cases: cases,
 		scanFn: func(fn repository.UtCaseScanFn) error {
-			// Deliver cases in two separate chunks to exercise multi-batch path.
+			// 分两批返回用例，覆盖多分片并行路径。
 			batch1 := []*entity.UtCase{cases[1], cases[2], cases[3]}
 			if err := fn(batch1); err != nil {
 				return err

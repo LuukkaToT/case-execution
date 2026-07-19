@@ -1,18 +1,17 @@
-// Package vo holds immutable domain value objects.
+// Package vo 包含不可变领域值对象。
 package vo
 
 import "strings"
 
-// Version is an immutable semantic version tag of a test case.
+// Version 是用例不可变的版本标识。
 type Version string
 
-// NewVersion trims whitespace; empty string becomes an empty Version and must
-// be validated by the caller. Validation rules (regex etc) live in the app
-// layer where they can surface to the user via grpc.InvalidArgument.
+// NewVersion 去除首尾空白。空字符串会生成空 Version，由调用方校验；正则等
+// 业务规则放在应用层，以便通过 grpc.InvalidArgument 返回给调用方。
 func NewVersion(s string) Version { return Version(strings.TrimSpace(s)) }
 
-// String implements fmt.Stringer.
+// String 实现 fmt.Stringer。
 func (v Version) String() string { return string(v) }
 
-// IsEmpty reports whether the version is the zero value.
+// IsEmpty 判断版本是否为零值。
 func (v Version) IsEmpty() bool { return string(v) == "" }

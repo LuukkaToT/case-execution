@@ -1,0 +1,59 @@
+name: 持续集成
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: execution-engine
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: "123456"
+          MYSQL_DATABASE: case_execution
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -p123456"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      rabbitmq:
+        image: rabbitmq:3.13-management
+        env:
+          RABBITMQ_DEFAULT_USER: practice
+          RABBITMQ_DEFAULT_PASS: practice
+        ports:
+          - 5673:5672
+        options: >-
+          --health-cmd="rabbitmq-diagnostics -q ping"
+          --health-interval=5s
+          --health-timeout=10s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: execution-engine/go.mod
+          cache-dependency-path: execution-engine/go.sum
+          cache: true
+      - name: 单元测试
+        run: go test ./...
+      - name: 竞态检查
+        run: go test -race ./...
+      - name: 静态检查
+        run: go vet ./...
+      - name: MySQL 集成测试
+        env:
+          TEST_MYSQL_DSN: root:123456@tcp(127.0.0.1:3307)/case_execution?parseTime=true&charset=utf8mb4&loc=Local
+        run: go test -tags=integration ./internal/infrastructure/persistence/mysql -count=1
+      - name: RabbitMQ 集成测试
+        env:
+          TEST_AMQP_URL: amqp://practice:practice@127.0.0.1:5673/
+        run: go test -tags=integration ./internal/infrastructure/mq/rabbitmq -count=1

@@ -2,9 +2,8 @@ package entity
 
 import "execution-engine/internal/domain/vo"
 
-// ExecutionTask is the MQ payload model (value object flavoured). It exists
-// separately from ExecutionRecord so the messaging format stays decoupled
-// from the persistence aggregate.
+// ExecutionTask 是发送到 MQ 的任务模型。它与 ExecutionRecord 分离，避免
+// 消息协议和持久化聚合相互耦合。
 type ExecutionTask struct {
 	ExecutionID int64
 	CaseID      int64
@@ -12,10 +11,9 @@ type ExecutionTask struct {
 	Version     vo.Version
 }
 
-// BatchAssemble zips records with their case-name map to produce MQ-bound
-// tasks, 1:1 port of the Python ExecutionTask.batch_assemble. Records whose
-// case_id is missing from nameMap are skipped rather than producing a task
-// with an empty case_name, which would confuse the worker.
+// BatchAssemble 根据执行记录和 case_id 到 case_name 的映射组装 MQ 任务，
+// 与 Python ExecutionTask.batch_assemble 语义一致。缺少名称映射的记录会被
+// 跳过，避免执行机收到 case_name 为空的无效任务。
 func BatchAssemble(records []*ExecutionRecord, nameMap map[int64]string) []ExecutionTask {
 	tasks := make([]ExecutionTask, 0, len(records))
 	for _, r := range records {

@@ -20,7 +20,7 @@ func newExecRecord(caseID int64, version, user string) *entity.ExecutionRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Add
+// 单条新增
 // ---------------------------------------------------------------------------
 
 func TestExecutionRepository_Add(t *testing.T) {
@@ -32,8 +32,25 @@ func TestExecutionRepository_Add(t *testing.T) {
 	assert.Greater(t, r.ExecutionID, int64(0))
 }
 
+func TestExecutionRepository_Add_相同请求幂等(t *testing.T) {
+	ctx := withTx(t)
+	repo := NewExecutionRepository(testDB)
+
+	first := entity.NewExecutionRecordForRequest("it-single-idempotent", 201, vo.Version("v1"), "alice")
+	second := entity.NewExecutionRecordForRequest("it-single-idempotent", 201, vo.Version("v1"), "alice")
+	require.NoError(t, repo.Add(ctx, first))
+	require.NoError(t, repo.Add(ctx, second))
+	assert.Equal(t, first.ExecutionID, second.ExecutionID)
+
+	var count int64
+	require.NoError(t, FromCtx(ctx, testDB).Model(&po.ExecutionRecord{}).
+		Where("request_id = ? AND case_id = ?", "it-single-idempotent", 201).
+		Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+}
+
 // ---------------------------------------------------------------------------
-// BatchAdd
+// 批量新增
 // ---------------------------------------------------------------------------
 
 func TestExecutionRepository_BatchAdd(t *testing.T) {
@@ -55,6 +72,24 @@ func TestExecutionRepository_BatchAdd(t *testing.T) {
 	assert.Len(t, ids, 3, "all ExecutionIDs should be unique")
 }
 
+func TestExecutionRepository_BatchAdd_相同请求幂等(t *testing.T) {
+	ctx := withTx(t)
+	repo := NewExecutionRepository(testDB)
+
+	first := []*entity.ExecutionRecord{
+		entity.NewExecutionRecordForRequest("it-batch-idempotent", 211, vo.Version("v1"), "alice"),
+		entity.NewExecutionRecordForRequest("it-batch-idempotent", 212, vo.Version("v1"), "alice"),
+	}
+	second := []*entity.ExecutionRecord{
+		entity.NewExecutionRecordForRequest("it-batch-idempotent", 211, vo.Version("v1"), "alice"),
+		entity.NewExecutionRecordForRequest("it-batch-idempotent", 212, vo.Version("v1"), "alice"),
+	}
+	require.NoError(t, repo.BatchAdd(ctx, first))
+	require.NoError(t, repo.BatchAdd(ctx, second))
+	assert.Equal(t, first[0].ExecutionID, second[0].ExecutionID)
+	assert.Equal(t, first[1].ExecutionID, second[1].ExecutionID)
+}
+
 func TestExecutionRepository_BatchAdd_Empty(t *testing.T) {
 	ctx := withTx(t)
 	repo := NewExecutionRepository(testDB)
@@ -62,7 +97,7 @@ func TestExecutionRepository_BatchAdd_Empty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// FindByID
+// 按编号查询
 // ---------------------------------------------------------------------------
 
 func TestExecutionRepository_FindByID_Found(t *testing.T) {
@@ -92,7 +127,7 @@ func TestExecutionRepository_FindByID_NotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Save
+// 保存状态
 // ---------------------------------------------------------------------------
 
 func TestExecutionRepository_Save(t *testing.T) {
@@ -121,8 +156,26 @@ func TestExecutionRepository_Save_NoMatchingRow(t *testing.T) {
 	assert.Contains(t, err.Error(), "no row matched")
 }
 
+func TestExecutionRepository_Save_DoesNotRegressAdvancedState(t *testing.T) {
+	ctx := withTx(t)
+	repo := NewExecutionRepository(testDB)
+
+	r := newExecRecord(301, "v3.0", "bob")
+	require.NoError(t, repo.Add(ctx, r))
+	require.NoError(t, FromCtx(ctx, testDB).Model(&po.ExecutionRecord{}).
+		Where("execution_id = ?", r.ExecutionID).
+		Update("execution_status", string(vo.StatusSuccess)).Error)
+
+	require.NoError(t, r.MarkAsWait())
+	require.NoError(t, repo.Save(ctx, r))
+
+	got, err := repo.FindByID(ctx, r.ExecutionID)
+	require.NoError(t, err)
+	assert.Equal(t, vo.StatusSuccess, got.ExecutionStatus)
+}
+
 // ---------------------------------------------------------------------------
-// BatchUpdateStatus
+// 批量更新状态
 // ---------------------------------------------------------------------------
 
 func TestExecutionRepository_BatchUpdateStatus(t *testing.T) {
@@ -138,7 +191,7 @@ func TestExecutionRepository_BatchUpdateStatus(t *testing.T) {
 
 	require.NoError(t, records[0].MarkAsWait())
 	require.NoError(t, records[1].MarkAsFailed())
-	// records[2] stays at StatusInit — should be skipped.
+	// records[2] 保持 INIT 状态，更新时应跳过。
 
 	require.NoError(t, repo.BatchUpdateStatus(ctx, records))
 
@@ -147,11 +200,25 @@ func TestExecutionRepository_BatchUpdateStatus(t *testing.T) {
 	r2, _ := repo.FindByID(ctx, records[2].ExecutionID)
 	assert.Equal(t, vo.StatusWait, r0.ExecutionStatus)
 	assert.Equal(t, vo.StatusFailed, r1.ExecutionStatus)
+	assert.NotNil(t, r1.FinishAt)
 	assert.Equal(t, vo.StatusInit, r2.ExecutionStatus, "StatusInit records must not be updated")
 }
 
+func TestExecutionRepository_BatchUpdateStatus_记录缺失时返回错误(t *testing.T) {
+	ctx := withTx(t)
+	repo := NewExecutionRepository(testDB)
+
+	record := &entity.ExecutionRecord{
+		ExecutionID:     999999997,
+		ExecutionStatus: vo.StatusWait,
+	}
+	err := repo.BatchUpdateStatus(ctx, []*entity.ExecutionRecord{record})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rows are missing")
+}
+
 // ---------------------------------------------------------------------------
-// TxRunner
+// 事务执行器
 // ---------------------------------------------------------------------------
 
 func TestTxRunner_Commit(t *testing.T) {
@@ -170,10 +237,10 @@ func TestTxRunner_Commit(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, insertedID, int64(0))
 
-	// Clean up committed row after test.
+	// 测试完成后清理已提交的数据行。
 	t.Cleanup(func() { testDB.Delete(&po.ExecutionRecord{}, insertedID) })
 
-	// Record must be visible outside the transaction.
+	// 提交后，事务外必须能够查到该记录。
 	got, err := repo.FindByID(context.Background(), insertedID)
 	require.NoError(t, err)
 	assert.NotNil(t, got)
@@ -197,7 +264,7 @@ func TestTxRunner_Rollback(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, forcedErr))
 
-	// Row must NOT be visible because the transaction was rolled back.
+	// 事务已回滚，因此事务外不能查到该记录。
 	if tentativeID > 0 {
 		got, err := repo.FindByID(context.Background(), tentativeID)
 		require.NoError(t, err)

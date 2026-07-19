@@ -28,7 +28,7 @@ func TestCanTransitTo(t *testing.T) {
 		to    ExecutionStatus
 		legal bool
 	}{
-		// Legal edges
+		// 合法迁移
 		{StatusInit, StatusWait, true},
 		{StatusInit, StatusFailed, true},
 		{StatusWait, StatusRunning, true},
@@ -36,15 +36,15 @@ func TestCanTransitTo(t *testing.T) {
 		{StatusWait, StatusSuccess, true},
 		{StatusRunning, StatusSuccess, true},
 		{StatusRunning, StatusFailed, true},
-		// Illegal: INIT cannot go to RUNNING/SUCCESS
+		// 非法迁移：INIT 不能直接进入 RUNNING/SUCCESS。
 		{StatusInit, StatusRunning, false},
 		{StatusInit, StatusSuccess, false},
-		// Illegal: terminal states cannot transition anywhere
+		// 非法迁移：终态不能继续迁移。
 		{StatusSuccess, StatusFailed, false},
 		{StatusSuccess, StatusWait, false},
 		{StatusFailed, StatusWait, false},
 		{StatusFailed, StatusRunning, false},
-		// Illegal: RUNNING cannot go back
+		// 非法迁移：RUNNING 不能回退。
 		{StatusRunning, StatusWait, false},
 		{StatusRunning, StatusInit, false},
 	}

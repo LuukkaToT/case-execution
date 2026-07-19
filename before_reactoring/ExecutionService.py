@@ -41,7 +41,7 @@ class ExecutionService:
             )
 
             execution_records.append(record)
-            name_map[case.case_id] = case.case_name  # 建立 ID -> Name 的映射
+            name_map[case.case_id] = case.case_name  # 建立用例编号到用例名称的映射
 
         return execution_records, name_map
 
@@ -52,7 +52,7 @@ class ExecutionService:
         if not records:
             return
 
-        # 这里可能抛出网络异常，由 App 层捕获
+        # 这里可能抛出网络异常，由应用层捕获
         result: List[BatchResult] = self.executor_client.batch_run(tasks)
 
         failed_id_set = set(result.failed_ids)

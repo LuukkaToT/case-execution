@@ -1,10 +1,8 @@
-// Package mysql wires gorm as the persistence adapter. It exposes:
+// Package mysql 使用 GORM 实现持久化适配器，提供：
 //
-//   - Open / Close: connection lifecycle.
-//   - TxRunner:     usecase.TxRunner implementation; propagates the active
-//     transaction via ctx so repositories don't need a second parameter.
-//   - WithTx/FromCtx: private plumbing for repositories to look up whichever
-//     *gorm.DB they should use, falling back to the pooled root handle.
+//   - Open/Close：管理连接生命周期。
+//   - TxRunner：实现 usecase.TxRunner，通过 ctx 传递当前事务。
+//   - WithTx/FromCtx：让仓储读取 ctx 中的事务，未找到时回退到根连接池。
 package mysql
 
 import (
@@ -17,7 +15,7 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// Config mirrors the mysql section of configs/config.yaml.
+// Config 对应 configs/config.yaml 中的 mysql 配置段。
 type Config struct {
 	DSN                string
 	MaxOpenConns       int
@@ -25,7 +23,7 @@ type Config struct {
 	ConnMaxLifetimeSec int
 }
 
-// Open initialises a gorm DB and tunes the sql.DB pool.
+// Open 初始化 GORM，并配置底层 sql.DB 连接池。
 func Open(cfg Config) (*gorm.DB, error) {
 	gdb, err := gorm.Open(mysql.Open(cfg.DSN), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
@@ -49,7 +47,7 @@ func Open(cfg Config) (*gorm.DB, error) {
 	return gdb, nil
 }
 
-// Close drains the connection pool.
+// Close 关闭数据库连接池。
 func Close(db *gorm.DB) error {
 	if db == nil {
 		return nil
@@ -61,17 +59,16 @@ func Close(db *gorm.DB) error {
 	return sqlDB.Close()
 }
 
-// txKey is the private ctx key; using an unexported empty-struct type
-// guarantees no third-party code can collide.
+// txKey 是私有 ctx key，使用未导出的空结构体类型可避免第三方键冲突。
 type txKey struct{}
 
-// WithTx returns a new ctx that carries tx; FromCtx looks it up.
+// WithTx 返回携带事务 tx 的新 ctx，FromCtx 负责读取。
 func WithTx(ctx context.Context, tx *gorm.DB) context.Context {
 	return context.WithValue(ctx, txKey{}, tx)
 }
 
-// FromCtx retrieves the active *gorm.DB: the tx if one is attached, else
-// the root db with ctx applied. Repositories should always call this.
+// FromCtx 优先返回 ctx 中的事务句柄，否则返回绑定 ctx 的根数据库句柄；仓储
+// 方法应始终通过该函数获取 *gorm.DB。
 func FromCtx(ctx context.Context, root *gorm.DB) *gorm.DB {
 	if tx, ok := ctx.Value(txKey{}).(*gorm.DB); ok && tx != nil {
 		return tx.WithContext(ctx)
@@ -79,17 +76,16 @@ func FromCtx(ctx context.Context, root *gorm.DB) *gorm.DB {
 	return root.WithContext(ctx)
 }
 
-// TxRunner implements usecase.TxRunner on top of gorm's transaction helper.
+// TxRunner 基于 GORM 事务方法实现 usecase.TxRunner。
 type TxRunner struct {
 	db *gorm.DB
 }
 
-// NewTxRunner constructs a TxRunner bound to the given db handle.
+// NewTxRunner 创建绑定指定数据库句柄的事务执行器。
 func NewTxRunner(db *gorm.DB) *TxRunner { return &TxRunner{db: db} }
 
-// Do runs fn inside a gorm transaction. The child ctx handed to fn carries
-// the *gorm.DB transactional handle; fn may call any repository method and
-// they will see the transaction transparently via FromCtx.
+// Do 在 GORM 事务中执行 fn。传给 fn 的子 ctx 携带事务句柄，fn 内调用的
+// 任意仓储方法都可通过 FromCtx 自动加入同一事务。
 func (r *TxRunner) Do(ctx context.Context, fn func(ctx context.Context) error) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return fn(WithTx(ctx, tx))

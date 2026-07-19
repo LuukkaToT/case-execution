@@ -5,18 +5,18 @@ import (
 	"execution-engine/internal/domain/vo"
 )
 
-// UtCase is the gorm PO for the ut_case table (the catalogue of test cases).
+// UtCase 是用例目录表 ut_case 对应的 GORM PO。
 type UtCase struct {
-	CaseID   int64  `gorm:"column:case_id;primaryKey"`
+	CaseID   int64  `gorm:"column:case_id;primaryKey;index:idx_version_caseid,priority:2;index:idx_channel_version_caseid,priority:3"`
 	CaseName string `gorm:"column:case_name;size:255"`
-	Version  string `gorm:"column:version;size:64;index"`
-	Channel  string `gorm:"column:channel;size:64;index"`
+	Version  string `gorm:"column:version;size:64;index;index:idx_version_caseid,priority:1;index:idx_channel_version_caseid,priority:2"`
+	Channel  string `gorm:"column:channel;size:64;index;index:idx_channel_version_caseid,priority:1"`
 }
 
-// TableName pins the physical table.
+// TableName 指定物理表名。
 func (UtCase) TableName() string { return "ut_case" }
 
-// ToEntity lifts the PO into the domain entity.
+// ToEntity 将 PO 转换为领域实体。
 func (p *UtCase) ToEntity() *entity.UtCase {
 	return &entity.UtCase{
 		CaseID:   p.CaseID,

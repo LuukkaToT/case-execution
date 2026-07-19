@@ -1,32 +1,24 @@
-// Package rabbitmq adapts port.UtCaseExecutorClient onto RabbitMQ via
-// amqp091-go. The implementation respects the amqp091 threading contract:
+// Package rabbitmq 基于 amqp091-go 实现 port.UtCaseExecutorClient，并遵守
+// amqp091 的并发约束：
 //
-//   - *amqp.Connection is safe for concurrent use (many goroutines may call
-//     Channel() simultaneously).
-//   - *amqp.Channel is NOT safe for concurrent use. Each in-flight publish
-//     loop must own its channel for the duration of the batch.
+//   - *amqp.Connection 支持并发使用，多个 goroutine 可同时调用 Channel()。
+//   - *amqp.Channel 不支持并发使用，每个进行中的发布分片必须独占 channel。
 //
-// Concurrency is achieved by pooling `channel_pool` ready-to-publish
-// *amqp.Channel instances (each with publisher confirms enabled) and letting
-// dispatch workers check one out per BatchRun invocation. N Channels on a
-// single Connection give true parallelism: amqp091 multiplexes TCP frames
-// across channels.
+// 客户端维护 channel_pool 个已开启 publisher confirm 的 *amqp.Channel；每次
+// BatchRun 独占一个 channel。单连接上的多个 channel 由 amqp091 复用 TCP 帧，
+// 实现分片级并行发布。
 //
-// # High-availability reconnect model
+// # 高可用重连模型
 //
-// A background reconnectLoop goroutine watches conn.NotifyClose. On
-// connection loss it:
+// 后台 reconnectLoop 监听 conn.NotifyClose，连接断开时：
 //
-//  1. Replaces connReady with a new open (blocking) channel so that borrow()
-//     callers block rather than fail.
-//  2. Drains and closes every pooled channel tied to the dead connection.
-//  3. Retries dial with exponential back-off (configurable).
-//  4. On success: pushes ChannelPool fresh channels into the pool and closes
-//     connReady, broadcasting to all blocked borrow() callers.
+//  1. 把 connReady 替换为未关闭的阻塞 channel，使 borrow() 等待而不是立即失败。
+//  2. 清空并关闭属于失效连接的空闲 channel。
+//  3. 按可配置的指数退避策略重新连接。
+//  4. 成功后补满 channel 池并关闭 connReady，唤醒全部等待者。
 //
-// This means dispatch workers never see ErrNotConnected during a transient
-// outage - they simply stall until the connection is restored or their ctx
-// is cancelled.
+// 因此短暂故障期间，下发 worker 会等待连接恢复或自身 ctx 取消，而不是直接
+// 收到 ErrNotConnected。
 package rabbitmq
 
 import (
@@ -34,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -45,15 +38,16 @@ import (
 	"execution-engine/internal/domain/vo"
 )
 
-// Config mirrors the rabbitmq section of configs/config.yaml.
+// Config 对应 configs/config.yaml 中的 rabbitmq 配置段。
 type Config struct {
 	URL              string
 	Exchange         string
 	ChannelPool      int
+	PublisherBuffer  int
 	ConfirmTimeoutMs int
-	// ReconnectInitialBackoffMs is the wait before the first retry (default 1 s).
+	// ReconnectInitialBackoffMs 是首次重连前的等待时间，默认 1 秒。
 	ReconnectInitialBackoffMs int
-	// ReconnectMaxBackoffMs caps the exponential back-off (default 30 s).
+	// ReconnectMaxBackoffMs 是指数退避上限，默认 30 秒。
 	ReconnectMaxBackoffMs int
 }
 
@@ -64,6 +58,9 @@ func (c *Config) applyDefaults() {
 	if c.ConfirmTimeoutMs <= 0 {
 		c.ConfirmTimeoutMs = 5000
 	}
+	if c.PublisherBuffer <= 0 {
+		c.PublisherBuffer = 4096
+	}
 	if c.ReconnectInitialBackoffMs <= 0 {
 		c.ReconnectInitialBackoffMs = 1000
 	}
@@ -72,31 +69,31 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// Sentinel errors surfaced to upper layers.
+// 向上层返回的哨兵错误。
 var (
 	ErrClientClosed   = errors.New("rabbitmq client closed")
 	ErrConfirmTimeout = errors.New("publisher confirm timed out")
 )
 
-// pooledChannel bundles an *amqp.Channel with its confirm stream and
-// close-notifier so workers can react to mid-batch failures.
+// pooledChannel 组合 amqp.Channel、确认流、退回流和关闭通知，使 worker 能够
+// 感知分片执行过程中的 channel 异常。
 type pooledChannel struct {
 	ch       *amqp.Channel
 	confirms chan amqp.Confirmation
+	returns  chan amqp.Return
 	closed   chan *amqp.Error
-	// broken is set to true when the channel can no longer be reused;
-	// release() will discard it and attempt to open a replacement.
+	// broken 表示 channel 已不可复用；release() 会丢弃并尝试创建替代 channel。
 	broken bool
 }
 
-// Client is a self-healing RabbitMQ publisher. Safe for concurrent use.
+// Client 是支持自恢复和并发调用的 RabbitMQ 发布器。
 //
-// Internal state (guarded by mu):
+// 以下内部状态由 mu 保护：
 //
-//   - conn      active AMQP connection (nil while reconnecting)
-//   - pool      buffered channel of ready *pooledChannel; capacity == ChannelPool
-//   - connReady signal channel; closed = connected/usable, open = reconnecting
-//   - closed    set true by Close(), causes all goroutines to exit
+//   - conn：当前 AMQP 连接，重连期间为 nil。
+//   - pool：保存可用 pooledChannel 的缓冲 channel，容量等于 ChannelPool。
+//   - connReady：连接信号，关闭表示可用，打开表示重连中。
+//   - closed：Close() 调用后置为 true，使后台 goroutine 退出。
 type Client struct {
 	cfg            Config
 	confirmTimeout time.Duration
@@ -105,24 +102,23 @@ type Client struct {
 	mu        sync.Mutex
 	conn      *amqp.Connection
 	pool      chan *pooledChannel // fixed-capacity; never replaced
-	connReady chan struct{}        // closed when connected; open (blocking) when reconnecting
+	connReady chan struct{}       // closed when connected; open (blocking) when reconnecting
 	closed    bool
 
-	// stopCh is closed by Close() to stop the reconnect loop.
+	// Close() 关闭 stopCh，用于停止重连循环。
 	stopCh chan struct{}
 }
 
 var _ port.UtCaseExecutorClient = (*Client)(nil)
 
-// NewClient dials the broker, warms up the channel pool, starts the
-// reconnect loop, and returns a ready-to-use client.
+// NewClient 连接 broker、预热 channel 池、启动重连循环，并返回可用客户端。
 func NewClient(cfg Config, log *zap.Logger) (*Client, error) {
 	if log == nil {
 		log = zap.NewNop()
 	}
 	cfg.applyDefaults()
 
-	// connReady starts CLOSED (we are connected).
+	// 初始连接可用，因此 connReady 从关闭状态开始。
 	ready := make(chan struct{})
 	close(ready)
 
@@ -142,12 +138,11 @@ func NewClient(cfg Config, log *zap.Logger) (*Client, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Connection lifecycle
+// 连接生命周期
 // ---------------------------------------------------------------------------
 
-// dial connects to the broker, declares the exchange, and fills the pool
-// with confirm-enabled channels. On error every partial resource is cleaned.
-// Caller must NOT hold c.mu.
+// dial 连接 broker、声明 exchange，并用已开启 confirm 的 channel 填满池。
+// 失败时清理所有已创建资源；调用方不得持有 c.mu。
 func (c *Client) dial() error {
 	conn, err := amqp.DialConfig(c.cfg.URL, amqp.Config{
 		Heartbeat: 30 * time.Second,
@@ -169,7 +164,7 @@ func (c *Client) dial() error {
 	c.mu.Lock()
 	c.conn = conn
 	for _, pc := range channels {
-		// pool is only written here and in release(); never overflows.
+		// pool 只在此处和 release() 中写入，正常情况下不会溢出。
 		select {
 		case c.pool <- pc:
 		default:
@@ -197,7 +192,7 @@ func (c *Client) declareExchange(conn *amqp.Connection) error {
 func (c *Client) buildChannels(conn *amqp.Connection) ([]*pooledChannel, error) {
 	channels := make([]*pooledChannel, 0, c.cfg.ChannelPool)
 	for i := 0; i < c.cfg.ChannelPool; i++ {
-		pc, err := openPooledChannel(conn)
+		pc, err := openPooledChannel(conn, c.cfg.PublisherBuffer)
 		if err != nil {
 			for _, q := range channels {
 				_ = q.ch.Close()
@@ -209,7 +204,7 @@ func (c *Client) buildChannels(conn *amqp.Connection) ([]*pooledChannel, error) 
 	return channels, nil
 }
 
-func openPooledChannel(conn *amqp.Connection) (*pooledChannel, error) {
+func openPooledChannel(conn *amqp.Connection, eventBuffer int) (*pooledChannel, error) {
 	ch, err := conn.Channel()
 	if err != nil {
 		return nil, err
@@ -220,27 +215,27 @@ func openPooledChannel(conn *amqp.Connection) (*pooledChannel, error) {
 	}
 	return &pooledChannel{
 		ch:       ch,
-		confirms: ch.NotifyPublish(make(chan amqp.Confirmation, 1024)),
+		confirms: ch.NotifyPublish(make(chan amqp.Confirmation, eventBuffer)),
+		returns:  ch.NotifyReturn(make(chan amqp.Return, eventBuffer)),
 		closed:   ch.NotifyClose(make(chan *amqp.Error, 1)),
 	}, nil
 }
 
 // ---------------------------------------------------------------------------
-// Reconnect loop (runs as a background goroutine for the client's lifetime)
+// 重连循环：在客户端生命周期内由后台 goroutine 持续运行
 // ---------------------------------------------------------------------------
 
-// reconnectLoop watches the active connection and triggers a reconnect cycle
-// whenever the connection is closed unexpectedly. It exits when stopCh is
-// closed (i.e. when the client itself is closed).
+// reconnectLoop 监听当前连接，连接意外关闭时启动重连；客户端关闭并触发
+// stopCh 后退出。
 func (c *Client) reconnectLoop() {
 	for {
-		// Obtain a snapshot of the current connection to watch.
+		// 获取当前连接快照并监听其关闭事件。
 		c.mu.Lock()
 		conn := c.conn
 		c.mu.Unlock()
 
 		if conn == nil {
-			// Shouldn't happen in normal operation; guard against races.
+			// 正常流程不应出现，用于防御并发边界。
 			select {
 			case <-c.stopCh:
 				return
@@ -249,24 +244,22 @@ func (c *Client) reconnectLoop() {
 			}
 		}
 
-		// Block until the connection is closed or the client stops.
+		// 阻塞等待连接关闭或客户端停止。
 		connClose := conn.NotifyClose(make(chan *amqp.Error, 1))
 		select {
 		case <-c.stopCh:
 			return
 		case amqpErr, ok := <-connClose:
-			// ok=false means the channel itself was garbage-collected or
-			// the connection was closed cleanly (e.g. by our own Close()).
+			// ok=false 表示通知 channel 被关闭，通常由连接正常关闭触发。
 			if !ok || amqpErr == nil {
-				// Check whether this is a deliberate shutdown.
+				// 判断是否为主动关闭。
 				c.mu.Lock()
 				isClosed := c.closed
 				c.mu.Unlock()
 				if isClosed {
 					return
 				}
-				// Spurious close on an otherwise healthy conn - treat as
-				// an unexpected drop and try to reconnect.
+				// 健康连接出现无错误关闭通知时，按意外断线处理并尝试重连。
 			}
 			if amqpErr != nil {
 				c.log.Warn("amqp connection closed unexpectedly",
@@ -279,32 +272,30 @@ func (c *Client) reconnectLoop() {
 
 		c.handleDisconnect()
 
-		// Check if we were stopped while reconnecting.
+		// 检查重连过程中客户端是否已停止。
 		c.mu.Lock()
 		isClosed := c.closed
 		c.mu.Unlock()
 		if isClosed {
 			return
 		}
-		// Loop to register a NotifyClose on the new connection.
+		// 继续循环，为新连接注册 NotifyClose。
 	}
 }
 
-// handleDisconnect signals to borrow() callers that we are reconnecting,
-// drains the stale pool, and then retries with exponential back-off until
-// either the dial succeeds or the client is closed.
+// handleDisconnect 通知 borrow() 当前处于重连状态，清空旧 channel 池，并按
+// 指数退避持续尝试，直到连接成功或客户端关闭。
 func (c *Client) handleDisconnect() {
-	// --- Step 1: Signal "reconnecting" to all borrow() callers ----------
-	newReady := make(chan struct{}) // intentionally left OPEN (blocking)
+	// --- 步骤一：通知全部 borrow() 调用方进入重连状态 ----------------
+	newReady := make(chan struct{}) // 保持打开状态，使借用方在重连完成前阻塞。
 	c.mu.Lock()
 	c.conn = nil
 	c.connReady = newReady
 	c.mu.Unlock()
 
-	// --- Step 2: Drain stale channels from the pool ----------------------
-	// Workers that currently hold a borrowed channel will mark it broken
-	// and release() will discard it (conn == nil). We only need to drain
-	// whatever is sitting idle in the pool.
+	// --- 步骤二：清理池中的旧 channel ---------------------------------
+	// 正在被 worker 使用的 channel 会被标记为 broken，并在 release() 时因
+	// conn == nil 被丢弃；这里仅需清理池中的空闲 channel。
 drainLoop:
 	for {
 		select {
@@ -315,7 +306,7 @@ drainLoop:
 		}
 	}
 
-	// --- Step 3: Retry with exponential back-off -------------------------
+	// --- 步骤三：按指数退避重试连接 -----------------------------------
 	backoff := time.Duration(c.cfg.ReconnectInitialBackoffMs) * time.Millisecond
 	maxBackoff := time.Duration(c.cfg.ReconnectMaxBackoffMs) * time.Millisecond
 	attempt := 0
@@ -333,6 +324,9 @@ drainLoop:
 			zap.Duration("backoff", backoff))
 
 		if err := c.reconnect(newReady); err != nil {
+			if errors.Is(err, ErrClientClosed) {
+				return
+			}
 			c.log.Warn("reconnect attempt failed",
 				zap.Int("attempt", attempt),
 				zap.Error(err))
@@ -347,9 +341,8 @@ drainLoop:
 	}
 }
 
-// reconnect performs a single dial attempt. On success it updates c.conn,
-// refills the pool, and closes readySignal to unblock all waiting borrow()
-// callers. On failure it returns an error without touching client state.
+// reconnect 执行一次连接尝试。成功后更新 c.conn、补满池并关闭 readySignal
+// 唤醒等待中的 borrow()；失败时返回错误，不修改现有客户端状态。
 func (c *Client) reconnect(readySignal chan struct{}) error {
 	conn, err := amqp.DialConfig(c.cfg.URL, amqp.Config{
 		Heartbeat: 30 * time.Second,
@@ -368,10 +361,17 @@ func (c *Client) reconnect(readySignal chan struct{}) error {
 		return err
 	}
 
-	// Commit the new connection and fill the pool before signalling.
-	// Order matters: pool must be full before we close readySignal,
-	// otherwise workers could rush borrow() and find an empty pool.
+	// 先提交新连接并填满池，再发送就绪信号。顺序不能反转，否则 worker 被
+	// 唤醒后可能读到空池。Close 可能在拨号期间发生，因此提交前必须再次校验状态。
 	c.mu.Lock()
+	if c.closed || c.connReady != readySignal {
+		c.mu.Unlock()
+		for _, pc := range channels {
+			_ = pc.ch.Close()
+		}
+		_ = conn.Close()
+		return ErrClientClosed
+	}
 	c.conn = conn
 	for _, pc := range channels {
 		select {
@@ -382,19 +382,17 @@ func (c *Client) reconnect(readySignal chan struct{}) error {
 	}
 	c.mu.Unlock()
 
-	// Broadcast "connected" to all blocked borrow() goroutines.
+	// 广播连接已恢复，唤醒全部阻塞的 borrow() goroutine。
 	close(readySignal)
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Pool borrow / release
+// channel 池的借用与归还
 // ---------------------------------------------------------------------------
 
-// borrow checks out a pooled channel for exclusive use by one goroutine.
-// If the client is currently reconnecting, borrow blocks until the connection
-// is restored or ctx is cancelled. This ensures workers stall rather than
-// immediately fail during a transient broker outage.
+// borrow 取出一个 channel 供单个 goroutine 独占使用。重连期间会阻塞到连接
+// 恢复或 ctx 取消，使 worker 在短暂 broker 故障时等待而非立即失败。
 func (c *Client) borrow(ctx context.Context) (*pooledChannel, error) {
 	for {
 		c.mu.Lock()
@@ -405,22 +403,19 @@ func (c *Client) borrow(ctx context.Context) (*pooledChannel, error) {
 		ready := c.connReady
 		c.mu.Unlock()
 
-		// Phase 1: wait until the client is connected.
+		// 阶段一：等待客户端连接可用。
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-c.stopCh:
 			return nil, ErrClientClosed
 		case <-ready:
-			// Connected; proceed to phase 2.
+			// 连接已恢复，进入阶段二。
 		}
 
-		// Phase 2: grab a channel from the pool.
-		// A very short window exists between connReady being closed and
-		// the pool being populated, but buildChannels + pool push happens
-		// under mu before close(readySignal), so the pool is always full
-		// by the time we reach here. We use a select with ctx and stopCh
-		// as a belt-and-suspenders guard.
+		// 阶段二：从池中获取 channel。buildChannels 和池写入在 mu 内完成，且
+		// 早于 readySignal 关闭，因此走到这里时池已经填充；select 同时监听
+		// ctx 和 stopCh，处理取消与关闭边界。
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -435,66 +430,74 @@ func (c *Client) borrow(ctx context.Context) (*pooledChannel, error) {
 	}
 }
 
-// release returns pc to the pool. If pc is broken (mid-batch error), it
-// opens a fresh channel as a replacement so the pool stays at full capacity.
-// When the connection itself is dead (reconnect in progress), release just
-// discards the broken channel; the reconnect loop is responsible for
-// replenishing the pool.
+// release 把 pc 归还到池中。若分片执行期间 channel 损坏，则尝试新建 channel
+// 补位；连接本身断开、正在重连时只丢弃损坏 channel，由重连循环统一补池。
 func (c *Client) release(pc *pooledChannel) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.closed {
+		c.mu.Unlock()
 		_ = pc.ch.Close()
 		return
 	}
 	if !pc.broken {
 		select {
 		case c.pool <- pc:
+			c.mu.Unlock()
 			return
 		default:
-			// Should never happen (pool cap == warmup count), but guard
-			// against double-release bugs.
+			// 正常情况下池容量等于预热数量，不会走到这里；该分支防御重复归还。
+			c.mu.Unlock()
 			_ = pc.ch.Close()
 			return
 		}
 	}
 
-	// Broken channel: discard and attempt to open a replacement.
+	// 损坏 channel：先在锁内取得连接快照，再在锁外执行可能阻塞的网络操作。
+	conn := c.conn
+	c.mu.Unlock()
 	_ = pc.ch.Close()
-	if c.conn == nil || c.conn.IsClosed() {
-		// Connection is dead; reconnect loop will refill the pool after
-		// it reconnects. Do not push a nil/broken replacement.
+	if conn == nil || conn.IsClosed() {
+		// 连接已失效，重连循环会在恢复后补满池，此处不放入无效替代项。
 		return
 	}
-	fresh, err := openPooledChannel(c.conn)
+	fresh, err := openPooledChannel(conn, c.cfg.PublisherBuffer)
 	if err != nil {
 		c.log.Warn("backfill pooled channel failed", zap.Error(err))
+		// 连接看似可用却无法创建 channel 时主动触发重连，避免池永久缩容。
+		c.mu.Lock()
+		stillCurrent := !c.closed && c.conn == conn
+		c.mu.Unlock()
+		if stillCurrent {
+			_ = conn.Close()
+		}
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.conn != conn {
+		_ = fresh.ch.Close()
 		return
 	}
 	select {
 	case c.pool <- fresh:
 	default:
-		// Pool already full (e.g. reconnect loop pushed channels while we
-		// were building this replacement). Discard to avoid overflow.
+		// 创建替代项期间重连循环可能已补满池，此时丢弃以避免溢出。
 		_ = fresh.ch.Close()
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Publish API
+// 发布接口
 // ---------------------------------------------------------------------------
 
-// publishPayload is the canonical JSON structure consumed by workers.
-// Kept byte-for-byte compatible with the Python dispatcher.
+// publishPayload 是执行机消费的标准 JSON 结构，与原 Python 下发格式保持兼容。
 type publishPayload struct {
 	ExecutionID int64  `json:"execution_id"`
 	CaseName    string `json:"case_name"`
 	Version     string `json:"version"`
 }
 
-// Execute publishes a single task. It internally delegates to BatchRun so
-// there is only one confirm/timeout code path to maintain.
+// Execute 发布单条任务，内部复用 BatchRun，只维护一套确认和超时逻辑。
 func (c *Client) Execute(ctx context.Context, record *entity.ExecutionRecord, caseName string) error {
 	task := entity.ExecutionTask{
 		ExecutionID: record.ExecutionID,
@@ -515,14 +518,11 @@ func (c *Client) Execute(ctx context.Context, record *entity.ExecutionRecord, ca
 	return nil
 }
 
-// BatchRun publishes every task on one exclusively owned *amqp.Channel and
-// waits for per-task publisher confirms. The batch is NOT split across
-// channels; all publishes and their confirms live on one channel so the
-// seqNo → execution_id mapping stays unambiguous.
+// BatchRun 在独占的 *amqp.Channel 上发布整个分片，并等待逐条 publisher
+// confirm。同一分片不跨 channel，保证 seqNo 到 execution_id 的映射无歧义。
 //
-// Parallelism across batches comes from the dispatch layer: N worker
-// goroutines each call BatchRun concurrently, each borrowing a different
-// pooled channel.
+// 分片间并行由下发层的 N 个 worker 实现，每个 worker 调用 BatchRun 时借用
+// 不同的池化 channel。
 func (c *Client) BatchRun(ctx context.Context, tasks []entity.ExecutionTask) (vo.BatchResult, error) {
 	if len(tasks) == 0 {
 		return vo.BatchResult{}, nil
@@ -533,9 +533,8 @@ func (c *Client) BatchRun(ctx context.Context, tasks []entity.ExecutionTask) (vo
 	}
 	defer c.release(pc)
 
-	// seq2id maps AMQP delivery-tag (sequence number) to execution_id so
-	// we can match confirms back to tasks. We read GetNextPublishSeqNo()
-	// BEFORE Publish because amqp091 increments the counter inside Publish.
+	// seq2id 把 AMQP delivery-tag 映射到 execution_id，用于确认结果回配。
+	// amqp091 会在 Publish 内递增序号，因此必须在发布前读取 GetNextPublishSeqNo()。
 	seq2id := make(map[uint64]int64, len(tasks))
 	var publishErr error
 
@@ -550,8 +549,7 @@ func (c *Client) BatchRun(ctx context.Context, tasks []entity.ExecutionTask) (vo
 			Version:     string(t.Version),
 		})
 		if err != nil {
-			// Marshal failure is deterministic and not MQ-related; record
-			// the task as failed and keep publishing the rest.
+			// 序列化失败是确定性错误，与 MQ 无关；标记当前任务失败并继续发布其余任务。
 			c.log.Warn("marshal task payload failed",
 				zap.Int64("execution_id", t.ExecutionID),
 				zap.Error(err))
@@ -561,10 +559,12 @@ func (c *Client) BatchRun(ctx context.Context, tasks []entity.ExecutionTask) (vo
 		err = pc.ch.PublishWithContext(ctx,
 			c.cfg.Exchange,
 			string(t.Version), // routing key = version
-			false, false,
+			true, false,       // mandatory: an unroutable message is a dispatch failure
 			amqp.Publishing{
 				ContentType:  "application/json",
 				DeliveryMode: amqp.Persistent,
+				MessageId:    strconv.FormatInt(t.ExecutionID, 10),
+				Type:         "ut_case.execute",
 				Body:         body,
 				Timestamp:    time.Now(),
 			},
@@ -577,19 +577,17 @@ func (c *Client) BatchRun(ctx context.Context, tasks []entity.ExecutionTask) (vo
 		seq2id[seq] = t.ExecutionID
 	}
 
-	// Build publishedIDs BEFORE waitConfirms, because waitConfirms drains
-	// seq2id by deleting confirmed entries; using it afterwards would give
-	// an empty set and incorrectly mark every task as failed.
+	// waitConfirms 会删除 seq2id 中已确认项，因此必须提前构建 publishedIDs，
+	// 否则确认完成后会误把所有任务判为未发布。
 	publishedIDs := make(map[int64]struct{}, len(seq2id))
 	for _, id := range seq2id {
 		publishedIDs[id] = struct{}{}
 	}
 
-	// Collect confirms for every successfully enqueued publish.
+	// 收集所有成功写入 channel 的发布确认。
 	success, failed := c.waitConfirms(ctx, pc, seq2id)
 
-	// Tasks that never made it into seq2id (marshal error or publish abort)
-	// must be flagged as failed in the result.
+	// 未进入 seq2id 的任务代表序列化失败或发布中断，必须归入失败结果。
 	for _, t := range tasks {
 		if _, ok := publishedIDs[t.ExecutionID]; !ok {
 			failed = append(failed, t.ExecutionID)
@@ -601,13 +599,14 @@ func (c *Client) BatchRun(ctx context.Context, tasks []entity.ExecutionTask) (vo
 		result.ErrorMessage = publishErr.Error()
 		return result, publishErr
 	}
+	if len(failed) > 0 {
+		result.ErrorMessage = "one or more messages were nack'd, returned, or unconfirmed"
+	}
 	return result, nil
 }
 
-// waitConfirms drains the confirms channel until all expected sequence
-// numbers have been ack'd/nack'd, the confirm timeout fires, the channel
-// dies, or ctx is cancelled. Any unresolved sequence is reported as failed
-// and the channel is marked broken.
+// waitConfirms 持续读取确认，直到全部序号收到 ack/nack、确认超时、channel
+// 关闭或 ctx 取消。所有未决序号归为失败，并把 channel 标记为 broken。
 func (c *Client) waitConfirms(
 	ctx context.Context,
 	pc *pooledChannel,
@@ -618,6 +617,8 @@ func (c *Client) waitConfirms(
 	}
 	deadline := time.NewTimer(c.confirmTimeout)
 	defer deadline.Stop()
+	returned := make(map[int64]struct{})
+	returnsCh := pc.returns
 
 	for len(seq2id) > 0 {
 		select {
@@ -638,7 +639,7 @@ func (c *Client) waitConfirms(
 			return
 
 		case reason, ok := <-pc.closed:
-			// Channel died mid-batch.
+			// channel 在分片发布过程中关闭。
 			for _, id := range seq2id {
 				failed = append(failed, id)
 			}
@@ -648,6 +649,20 @@ func (c *Client) waitConfirms(
 					zap.String("reason", reason.Error()))
 			}
 			return
+
+		case returnedMessage, ok := <-returnsCh:
+			if !ok {
+				returnsCh = nil
+				continue
+			}
+			if id, ok := executionIDFromReturn(returnedMessage); ok {
+				returned[id] = struct{}{}
+			}
+			c.log.Warn("publisher message returned as unroutable",
+				zap.String("message_id", returnedMessage.MessageId),
+				zap.Uint16("reply_code", returnedMessage.ReplyCode),
+				zap.String("reply_text", returnedMessage.ReplyText),
+				zap.String("routing_key", returnedMessage.RoutingKey))
 
 		case cnf, ok := <-pc.confirms:
 			if !ok {
@@ -659,12 +674,13 @@ func (c *Client) waitConfirms(
 			}
 			id, present := seq2id[cnf.DeliveryTag]
 			if !present {
-				// Stale confirm from a previous publish cycle on this
-				// channel; safe to ignore.
+				// 当前 channel 上一轮发布残留的确认，可安全忽略。
 				continue
 			}
 			delete(seq2id, cnf.DeliveryTag)
-			if cnf.Ack {
+			if _, wasReturned := returned[id]; wasReturned {
+				failed = append(failed, id)
+			} else if cnf.Ack {
 				success = append(success, id)
 			} else {
 				c.log.Warn("publisher nack received",
@@ -674,16 +690,60 @@ func (c *Client) waitConfirms(
 			}
 		}
 	}
+
+	// 对 mandatory 且无法路由的消息，RabbitMQ 会先发送 basic.return，再发送
+	// basic.ack。库把两者投递到不同的缓冲 channel，select 可能任意选择，因此
+	// 最后一条 confirm 后再次清空 return，并把误入成功分区的 ID 移到失败分区。
+	for returnsCh != nil {
+		select {
+		case returnedMessage, ok := <-returnsCh:
+			if !ok {
+				returnsCh = nil
+				continue
+			}
+			if id, ok := executionIDFromReturn(returnedMessage); ok {
+				returned[id] = struct{}{}
+			}
+		default:
+			returnsCh = nil
+		}
+	}
+	if len(returned) == 0 {
+		return
+	}
+	failedSet := make(map[int64]struct{}, len(failed)+len(returned))
+	for _, id := range failed {
+		failedSet[id] = struct{}{}
+	}
+	confirmed := success[:0]
+	for _, id := range success {
+		if _, wasReturned := returned[id]; wasReturned {
+			if _, exists := failedSet[id]; !exists {
+				failed = append(failed, id)
+				failedSet[id] = struct{}{}
+			}
+			continue
+		}
+		confirmed = append(confirmed, id)
+	}
+	success = confirmed
 	return
 }
 
+func executionIDFromReturn(returnedMessage amqp.Return) (int64, bool) {
+	id, err := strconv.ParseInt(returnedMessage.MessageId, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
 // ---------------------------------------------------------------------------
-// Shutdown
+// 关闭流程
 // ---------------------------------------------------------------------------
 
-// Close stops the reconnect loop, drains the channel pool, and closes the
-// underlying AMQP connection. ctx bounds the total time budget; if it
-// expires the connection is force-closed.
+// Close 停止重连循环、清空 channel 池并关闭底层 AMQP 连接。ctx 限制关闭总
+// 时长，超时后直接关闭连接。
 func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed {
@@ -695,10 +755,10 @@ func (c *Client) Close(ctx context.Context) error {
 	c.conn = nil
 	c.mu.Unlock()
 
-	// Stop the reconnect loop first.
+	// 首先停止重连循环。
 	close(c.stopCh)
 
-	// Drain the pool.
+	// 清空 channel 池。
 	drained := 0
 	poolCap := cap(c.pool)
 drainClose:
@@ -722,7 +782,7 @@ drainClose:
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// 辅助函数
 // ---------------------------------------------------------------------------
 
 func failedAll(tasks []entity.ExecutionTask, msg string) vo.BatchResult {

@@ -2,14 +2,14 @@ package vo
 
 import "strings"
 
-// Channel identifies a test-case channel (e.g. protocol family / product line).
+// Channel 表示用例渠道，例如协议族或产品线。
 type Channel string
 
-// NewChannel trims whitespace only; semantic validation is done at the app layer.
+// NewChannel 只去除首尾空白，语义校验由应用层负责。
 func NewChannel(s string) Channel { return Channel(strings.TrimSpace(s)) }
 
-// String implements fmt.Stringer.
+// String 实现 fmt.Stringer。
 func (c Channel) String() string { return string(c) }
 
-// IsEmpty reports whether the channel is the zero value.
+// IsEmpty 判断渠道是否为零值。
 func (c Channel) IsEmpty() bool { return string(c) == "" }

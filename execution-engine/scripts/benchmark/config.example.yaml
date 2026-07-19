@@ -1,0 +1,37 @@
+# 复制到 Git 仓库外再填写真实测试环境地址和账号，不要提交密码。
+server:
+  grpc_addr: ":9090"
+  max_recv_msg_mb: 16
+
+mysql:
+  dsn: "用户名:密码@tcp(MySQL地址:端口)/case_execution_bench?parseTime=true&charset=utf8mb4&loc=Local"
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime_sec: 3600
+
+rabbitmq:
+  url: "amqp://用户名:密码@RabbitMQ地址:端口/虚拟主机"
+  exchange: "ut.exec.bench.20260720"
+  channel_pool: 8
+  confirm_timeout_ms: 5000
+  reconnect_initial_backoff_ms: 1000
+  reconnect_max_backoff_ms: 30000
+
+dispatch:
+  batch_size: 1000
+  worker_count: 4
+  max_concurrent_batches: 2
+
+outbox:
+  enabled: true
+  fast_path_grace_ms: 10000
+  poll_interval_ms: 1000
+  batch_size: 200
+  lease_duration_ms: 30000
+  max_attempts: 8
+  initial_backoff_ms: 1000
+  max_backoff_ms: 60000
+
+logger:
+  level: "info"
+  encoding: "json"

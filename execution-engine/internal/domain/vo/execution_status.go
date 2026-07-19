@@ -1,12 +1,10 @@
 package vo
 
-// ExecutionStatus models the persistent status column on execution_record.
+// ExecutionStatus 对应 execution_record 表中的持久化状态字段。
 //
-// The engine itself only writes two terminal statuses after dispatch:
-// StatusWait (MQ publish succeeded, waiting for worker) and StatusFailed
-// (dispatch failed). Non-terminal statuses (INIT, RUNNING) and success are
-// owned by Python Web via worker callbacks; we still model them here so the
-// state-machine rejects illegal transitions from aged records.
+// 引擎在下发后只写 WAIT（MQ 发布成功，等待执行机）或 FAILED（下发失败）。
+// RUNNING、SUCCESS 等后续状态由执行机回调 Python Web 更新；这里仍完整建模，
+// 以便状态机拒绝非法迁移。
 type ExecutionStatus string
 
 const (
@@ -17,19 +15,19 @@ const (
 	StatusFailed  ExecutionStatus = "FAILED"
 )
 
-// IsTerminal reports whether the status cannot legally transit further.
+// IsTerminal 判断当前状态是否为不可继续迁移的终态。
 func (s ExecutionStatus) IsTerminal() bool {
 	return s == StatusSuccess || s == StatusFailed
 }
 
-// CanTransitTo returns true iff s -> next is a legal state-machine edge.
+// CanTransitTo 判断 s 到 next 是否为合法状态机边。
 //
-// Legal edges:
+// 合法迁移：
 //
 //	INIT    -> WAIT | FAILED
 //	WAIT    -> RUNNING | FAILED | SUCCESS
 //	RUNNING -> SUCCESS | FAILED
-//	SUCCESS | FAILED are terminal
+//	SUCCESS | FAILED 为终态
 func (s ExecutionStatus) CanTransitTo(next ExecutionStatus) bool {
 	switch s {
 	case StatusInit:

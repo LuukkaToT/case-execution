@@ -47,7 +47,7 @@ func TestMarkAsRunning(t *testing.T) {
 func TestMarkAsWait_IllegalTransition(t *testing.T) {
 	r := NewExecutionRecord(1, vo.Version("v1"), "u")
 	require.NoError(t, r.MarkAsWait())
-	// WAIT -> WAIT is illegal
+	// WAIT 不能再次迁移到 WAIT。
 	err := r.MarkAsWait()
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, errs.ErrIllegalStatusTransition))
@@ -56,7 +56,7 @@ func TestMarkAsWait_IllegalTransition(t *testing.T) {
 func TestMarkAsFailed_FromTerminal(t *testing.T) {
 	r := NewExecutionRecord(1, vo.Version("v1"), "u")
 	require.NoError(t, r.MarkAsFailed())
-	// FAILED -> FAILED is illegal
+	// FAILED 为终态，不能再次迁移到 FAILED。
 	err := r.MarkAsFailed()
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, errs.ErrIllegalStatusTransition))
@@ -64,7 +64,7 @@ func TestMarkAsFailed_FromTerminal(t *testing.T) {
 
 func TestMarkAsRunning_IllegalFromInit(t *testing.T) {
 	r := NewExecutionRecord(1, vo.Version("v1"), "u")
-	// INIT -> RUNNING is illegal
+	// INIT 不能跳过 WAIT 直接迁移到 RUNNING。
 	err := r.MarkAsRunning()
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, errs.ErrIllegalStatusTransition))

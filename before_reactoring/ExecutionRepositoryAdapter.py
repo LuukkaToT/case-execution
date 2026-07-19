@@ -8,7 +8,7 @@ from .dao.table import ExecutionRecordTable
 from .dao.execution_dao import ExecutionRecordDao
 
 
-# optimize 添加审计日志
+# 待优化：添加审计日志
 class ExecutionRepositoryAdapter(ExecutionRepository):
     def __init__(self):
         self.dao = ExecutionRecordDao()
