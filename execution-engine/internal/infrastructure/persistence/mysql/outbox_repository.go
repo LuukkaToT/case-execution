@@ -19,10 +19,12 @@ type OutboxRepository struct {
 	root *gorm.DB
 }
 
+// NewOutboxRepository 创建绑定根数据库句柄的可靠消息仓储。
 func NewOutboxRepository(root *gorm.DB) repository.OutboxRepository {
 	return &OutboxRepository{root: root}
 }
 
+// Add 幂等插入单条消息；execution_id 冲突时回读已有记录并复用其主键。
 func (r *OutboxRepository) Add(ctx context.Context, message *entity.OutboxMessage) error {
 	db := FromCtx(ctx, r.root)
 	row := po.FromOutboxMessage(message)
@@ -38,6 +40,7 @@ func (r *OutboxRepository) Add(ctx context.Context, message *entity.OutboxMessag
 	return nil
 }
 
+// BatchAdd 每 200 条批量插入消息，并按 execution_id 回读幂等结果。
 func (r *OutboxRepository) BatchAdd(ctx context.Context, messages []*entity.OutboxMessage) error {
 	if len(messages) == 0 {
 		return nil
@@ -74,6 +77,7 @@ func (r *OutboxRepository) BatchAdd(ctx context.Context, messages []*entity.Outb
 	return nil
 }
 
+// ClaimPending 在短事务内跳过其他实例持有的行，领取到期 PENDING 或租约过期 PROCESSING 消息。
 func (r *OutboxRepository) ClaimPending(
 	ctx context.Context,
 	limit int,
@@ -129,6 +133,7 @@ func (r *OutboxRepository) ClaimPending(
 	return claimed, err
 }
 
+// MarkPublished 只允许当前租约持有者或尚未被 Relay 领取的快速路径消息完成发布。
 func (r *OutboxRepository) MarkPublished(ctx context.Context, executionIDs []int64, leaseToken string, publishedAt time.Time) error {
 	return r.updateByExecutionIDs(ctx, executionIDs, leaseToken, map[string]any{
 		"state":        string(entity.OutboxPublished),
@@ -139,6 +144,7 @@ func (r *OutboxRepository) MarkPublished(ctx context.Context, executionIDs []int
 	})
 }
 
+// MarkRetry 记录失败摘要和下次可用时间，并释放当前租约。
 func (r *OutboxRepository) MarkRetry(ctx context.Context, executionIDs []int64, leaseToken string, availableAt time.Time, lastError string) error {
 	return r.updateByExecutionIDs(ctx, executionIDs, leaseToken, map[string]any{
 		"state":        string(entity.OutboxPending),
@@ -149,6 +155,7 @@ func (r *OutboxRepository) MarkRetry(ctx context.Context, executionIDs []int64, 
 	})
 }
 
+// MarkDead 把消息标记为不再自动重试，并释放当前租约。
 func (r *OutboxRepository) MarkDead(ctx context.Context, executionIDs []int64, leaseToken string, lastError string) error {
 	return r.updateByExecutionIDs(ctx, executionIDs, leaseToken, map[string]any{
 		"state":       string(entity.OutboxDead),
@@ -158,6 +165,7 @@ func (r *OutboxRepository) MarkDead(ctx context.Context, executionIDs []int64, l
 	})
 }
 
+// updateByExecutionIDs 通过状态与租约令牌做比较更新；影响行数不符表示租约已丢失。
 func (r *OutboxRepository) updateByExecutionIDs(ctx context.Context, executionIDs []int64, leaseToken string, updates map[string]any) error {
 	if len(executionIDs) == 0 {
 		return nil
