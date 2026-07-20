@@ -155,12 +155,18 @@ func (s *DispatchAppService) ExecuteCaseWithRequest(
 	if record.Version != v {
 		return record.ExecutionID, "", errs.NewInvalidArgument("request_id was already used with a different version")
 	}
+
+	// 🚩这里校验状态是为了防止，这是客户端的重试请求，即服务端执行完逻辑回复给客户端
+	// 客户端没收到响应所以重试了。前面的Add方法会校验requestId，如果是重复的请求，会将
+	// 之前的record写回， 这里通过判断状态就能确定是否为重试
 	if record.ExecutionStatus != vo.StatusInit {
 		if record.ExecutionStatus == vo.StatusFailed {
 			return record.ExecutionID, vo.StatusFailed, nil
 		}
 		return record.ExecutionID, vo.StatusWait, nil
 	}
+
+	// 1. 🚩如果此处发生服务宕机mq还没发 , relay会再发一次, 这是异常情况的兜底
 
 	// 阶段二：在数据库事务之外发布 MQ，与原 Python 语义一致。
 	mqErr := s.executor.Execute(ctx, record, caseName)
@@ -170,6 +176,9 @@ func (s *DispatchAppService) ExecuteCaseWithRequest(
 			zap.Int64("case_id", caseID),
 			zap.Error(mqErr))
 	}
+
+	// 2. 🚩如果此处发生服务宕机，Relay无法判断是否发过消息，会再发一次，所以这里的语义是 at-least-once
+	// 至少会投递一次
 
 	// 阶段三：根据发布结果更新状态。MQ 发布完成后，不能让 RPC 客户端断开
 	// 阻止结果持久化，因此保留请求级 values，但为补偿写入提供独立超时。
@@ -236,6 +245,9 @@ func (s *DispatchAppService) ExecuteAllCasesWithRequest(ctx context.Context, req
 	scan := func(ctx context.Context, size int, fn repository.UtCaseScanFn) error {
 		return s.caseRepo.ScanByVersion(ctx, v, size, fn)
 	}
+	// 🚩 由于按信道执行和按照版本执行区别只在于筛选条件不同，下发流程一样，所以这里直接
+	// 传入筛选条件，下发流程只负责调用，然后下发不是「为了函数指针而函数指针」，而是让
+	// dispatchStream 只依赖「能 count、能 scan」这两个能力，和具体查询条件解耦。
 	return s.dispatchStream(ctx, requestID, v, user, count, scan, cb)
 }
 
@@ -422,6 +434,10 @@ func (s *DispatchAppService) dispatchOneBatch(
 
 	// 阶段二：幂等重试复用已存在的记录。只有 INIT 记录需要发布；已经推进的
 	// 记录直接写入进度结果，不重复发送消息。
+	// 调用方带着同一个 request_id 又来了一次（网络重试、超时重打等）。
+	// BatchAdd 因唯一键冲突回读已有记录，再按状态决定要不要重新发 MQ。
+	// 🚩一句话：是可重入的幂等；INIT 会再发，已终态则只回放结果。重复投递窗口要靠消费端幂等兜住。
+	// 网络断、客户端取消导致请求 ctx 取消、服务闪断后重启，只要调用方再用原来的 request_id，就能幂等重入。
 	pendingRecords := make([]*entity.ExecutionRecord, 0, len(records))
 	result := vo.BatchResult{}
 	for _, record := range records {
