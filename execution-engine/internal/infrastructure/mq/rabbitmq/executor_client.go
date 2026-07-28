@@ -141,7 +141,8 @@ func NewClient(cfg Config, log *zap.Logger) (*Client, error) {
 // 连接生命周期
 // ---------------------------------------------------------------------------
 
-// dial 连接 broker、声明 exchange，并用已开启 confirm 的 channel 填满池。
+// dial（英文:拨号，网络里标识 主动发起并建立连接）
+// 连接 broker、声明 exchange，并用已开启 confirm 的 channel 填满池。
 // 失败时清理所有已创建资源；调用方不得持有 c.mu。
 func (c *Client) dial() error {
 	conn, err := amqp.DialConfig(c.cfg.URL, amqp.Config{
@@ -247,6 +248,8 @@ func (c *Client) reconnectLoop() {
 		// 阻塞等待连接关闭或客户端停止。
 		connClose := conn.NotifyClose(make(chan *amqp.Error, 1))
 		select {
+		// connClose 负责「连接没了」；stopCh 负责「客户端要停了」。
+		// 两者有重叠，但 stopCh 是更快、更稳的关机通道，不是重复的无效分支。
 		case <-c.stopCh:
 			return
 		case amqpErr, ok := <-connClose:
@@ -299,7 +302,9 @@ func (c *Client) handleDisconnect() {
 drainLoop:
 	for {
 		select {
-		case pc := <-c.pool:
+		// 这里的思路是，池里还有多少空闲，就关多少
+		// 已经借出的，让拥有者自己处理，自己发现坏了，然后直接丢弃不归还池里
+		case pc := <-c.pool: // 池空了会一直阻塞，所以这里要用select case
 			_ = pc.ch.Close()
 		default:
 			break drainLoop
@@ -311,6 +316,8 @@ drainLoop:
 	maxBackoff := time.Duration(c.cfg.ReconnectMaxBackoffMs) * time.Millisecond
 	attempt := 0
 
+	// 设计意图：broker 临时挂掉时 worker 堵在 connReady 上等恢复，
+	// 而不是把客户端判死。若要「N 次失败后放弃」，当前代码没做，得另加策略。
 	for {
 		select {
 		case <-c.stopCh:
@@ -444,7 +451,7 @@ func (c *Client) release(pc *pooledChannel) {
 		case c.pool <- pc:
 			c.mu.Unlock()
 			return
-		default:
+		default: //如果上一个case池满了，就会走这个分支
 			// 正常情况下池容量等于预热数量，不会走到这里；该分支防御重复归还。
 			c.mu.Unlock()
 			_ = pc.ch.Close()

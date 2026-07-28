@@ -6,28 +6,34 @@
 
 ### P0：必须能脱离代码讲清楚
 
-| 主线 | 必读文件 | 重点位置 |
-| --- | --- | --- |
-| 批量并发流水线 | `internal/usecase/dispatch_app_service.go` | `dispatchStream`、`dispatchOneBatch`、`completeBatchResult` |
-| DB/MQ 一致性 | `internal/usecase/outbox_relay.go` | `DispatchOnce`、重试退避、成功/重试/DEAD 分区 |
-| Outbox 多实例竞争 | `internal/infrastructure/persistence/mysql/outbox_repository.go` | `ClaimPending`、租约令牌、条件更新 |
-| RabbitMQ 可靠发布 | `internal/infrastructure/mq/rabbitmq/executor_client.go` | `BatchRun`、`waitConfirms`、`reconnect`、`borrow/release` |
-| 请求幂等与状态防回退 | `internal/infrastructure/persistence/mysql/execution_repository.go` | `Add`、`BatchAdd`、`Save`、`BatchUpdateStatus` |
-| API 边界 | `api/proto/taskexecution/v1/task_execution.proto` | 三个 RPC、服务端流、request_id、下发状态定义 |
+
+| 主线            | 必读文件                                                                | 重点位置                                                      |
+| ------------- | ------------------------------------------------------------------- | --------------------------------------------------------- |
+| 批量并发流水线       | `internal/usecase/dispatch_app_service.go`                          | `dispatchStream`、`dispatchOneBatch`、`completeBatchResult` |
+| DB/MQ 一致性     | `internal/usecase/outbox_relay.go`                                  | `DispatchOnce`、重试退避、成功/重试/DEAD 分区                         |
+| Outbox 多实例竞争  | `internal/infrastructure/persistence/mysql/outbox_repository.go`    | `ClaimPending`、租约令牌、条件更新                                  |
+| RabbitMQ 可靠发布 | `internal/infrastructure/mq/rabbitmq/executor_client.go`            | `BatchRun`、`waitConfirms`、`reconnect`、`borrow/release`    |
+| 请求幂等与状态防回退    | `internal/infrastructure/persistence/mysql/execution_repository.go` | `Add`、`BatchAdd`、`Save`、`BatchUpdateStatus`               |
+| API 边界        | `api/proto/taskexecution/v1/task_execution.proto`                   | 三个 RPC、服务端流、request_id、下发状态定义                             |
+
 
 P0 文件不是要求逐行背诵，而是关闭编辑器后仍能画出数据流、说出失败窗口，并解释为什么这样设计。
 
 ### P1：面试官继续深挖时要能定位
 
-| 主题 | 文件 | 要点 |
-| --- | --- | --- |
-| 游标扫描 | `internal/infrastructure/persistence/mysql/ut_case_repository.go` | `FindInBatches`、复合索引、有界内存 |
-| 状态机 | `internal/domain/vo/execution_status.go` | INIT、WAIT、RUNNING、SUCCESS、FAILED 的合法迁移 |
-| 执行记录聚合 | `internal/domain/entity/execution_record.go` | 状态转换和时间字段 |
-| gRPC 适配 | `internal/infrastructure/grpcserver/handler.go` | 参数校验、错误码映射、单协程发送进度 |
-| 服务生命周期 | `cmd/server/main.go` | 依赖装配、Relay 启动、退出顺序 |
-| 健康检查 | `internal/infrastructure/grpcserver/server.go` | SERVING/NOT_SERVING、优雅停机超时 |
-| 数据库结构 | `scripts/schema.sql` | 幂等唯一键、扫描索引、Outbox 索引 |
+
+| 主题      | 文件                                                                | 要点                                     |
+| ------- | ----------------------------------------------------------------- | -------------------------------------- |
+| 游标扫描    | `internal/infrastructure/persistence/mysql/ut_case_repository.go` | `FindInBatches`、复合索引、有界内存              |
+| 状态机     | `internal/domain/vo/execution_status.go`                          | INIT、WAIT、RUNNING、SUCCESS、FAILED 的合法迁移 |
+| 执行记录聚合  | `internal/domain/entity/execution_record.go`                      | 状态转换和时间字段                              |
+| gRPC 适配 | `internal/infrastructure/grpcserver/handler.go`                   | 参数校验、错误码映射、单协程发送进度                     |
+| 服务生命周期  | `cmd/server/main.go`                                              | 依赖装配、Relay 启动、退出顺序                     |
+| 健康检查    | `internal/infrastructure/grpcserver/server.go`                    | SERVING/NOT_SERVING、优雅停机超时             |
+| 数据库结构   | `scripts/schema.sql`                                              | 幂等唯一键、扫描索引、Outbox 索引                   |
+
+
+
 
 ### P2：知道作用即可
 
@@ -37,20 +43,28 @@ P0 文件不是要求逐行背诵，而是关闭编辑器后仍能画出数据�
 - `cmd/bench`：性能证据采集工具，不是调度算法本身。
 - 普通值对象、简单构造器和配置映射不需要花大量时间背。
 
+
+
 ## 二、主线一：为什么拆 Go，以及批量流水线如何工作
+
+
 
 ### 必读代码
 
 1. `internal/usecase/dispatch_app_service.go`
-   - `dispatchStream`：生产者、worker、聚合器和全局批量信号量。
-   - `dispatchOneBatch`：DB 事务、MQ 发布、状态回写三个阶段。
-   - `completeBatchResult`：部分成功时保留已确认结果。
+  - `dispatchStream`：生产者、worker、聚合器和全局批量信号量。
+  - `dispatchOneBatch`：DB 事务、MQ 发布、状态回写三个阶段。
+  - `completeBatchResult`：部分成功时保留已确认结果。
 2. `internal/infrastructure/persistence/mysql/ut_case_repository.go`
-   - `ScanByVersion`、`ScanByChannelVersion`、`scan`。
+  - `ScanByVersion`、`ScanByChannelVersion`、`scan`。
 3. `internal/infrastructure/grpcserver/handler.go`
-   - `progressForwarder`。
+  - `progressForwarder`。
+
+
 
 ### 面试高频追问
+
+
 
 #### 为什么不继续优化 Python
 
@@ -62,6 +76,8 @@ P0 文件不是要求逐行背诵，而是关闭编辑器后仍能画出数据�
 4. 下发边界稳定，适合独立扩缩容；最终状态仍保留在 Python，降低迁移面。
 5. 代价是增加 RPC、部署和一致性处理，所以只抽性能热点，不重写整个系统。
 
+
+
 #### 为什么用生产者—worker—聚合器
 
 - 生产者负责游标扫描和稳定分片编号。
@@ -69,6 +85,8 @@ P0 文件不是要求逐行背诵，而是关闭编辑器后仍能画出数据�
 - 聚合器单协程调用 `stream.Send`，避免并发发送不安全和累计数竞争。
 - 有界 channel 提供背压，RabbitMQ 或数据库变慢时，扫描不会无限占用内存。
 - 全局 `batchSlots` 限制同时运行的批量 RPC，避免多个大任务叠加压垮中间件。
+
+
 
 #### 内存为什么不会随 52,265 条线性增长
 
@@ -93,7 +111,11 @@ P0 文件不是要求逐行背诵，而是关闭编辑器后仍能画出数据�
 3. 回答：如果 `progressCh` 不关闭，聚合器会发生什么；由谁负责关闭最安全。
 4. 找出代码中三个响应 `ctx.Done()` 的位置，说明各自防止什么泄漏。
 
+
+
 ## 三、主线二：MySQL 与 RabbitMQ 双写一致性
+
+
 
 ### 必读代码
 
@@ -103,16 +125,24 @@ P0 文件不是要求逐行背诵，而是关闭编辑器后仍能画出数据�
 4. `internal/infrastructure/persistence/mysql/outbox_repository.go` 的 `ClaimPending`。
 5. `internal/usecase/outbox_relay_test.go`。
 
+
+
 ### 必须会画的故障矩阵
 
-| 故障窗口 | 没有 Outbox | 当前方案 |
-| --- | --- | --- |
-| DB 提交前崩溃 | DB、消息都没有 | 事务整体回滚 |
-| DB 提交后、MQ 发布前崩溃 | 执行记录存在但任务永久丢失 | Relay 重发 PENDING |
-| MQ 确认后、DB 回写前崩溃 | 无法判断消息是否到达 | Relay 可能重发，消费者按 execution_id 去重 |
-| Relay 持有消息时崩溃 | 消息可能永久卡住 | 租约过期后其他实例接管 |
+
+| 故障窗口            | 没有 Outbox     | 当前方案                            |
+| --------------- | ------------- | ------------------------------- |
+| DB 提交前崩溃        | DB、消息都没有      | 事务整体回滚                          |
+| DB 提交后、MQ 发布前崩溃 | 执行记录存在但任务永久丢失 | Relay 重发 PENDING                |
+| MQ 确认后、DB 回写前崩溃 | 无法判断消息是否到达    | Relay 可能重发，消费者按 execution_id 去重 |
+| Relay 持有消息时崩溃   | 消息可能永久卡住      | 租约过期后其他实例接管                     |
+
+
+
 
 ### 面试高频追问
+
+
 
 #### 为什么不能用一个数据库事务包住 MQ 发布
 
@@ -143,6 +173,8 @@ go test -tags=integration ./internal/infrastructure/persistence/mysql -run "Test
 
 ## 四、主线三：RabbitMQ 可靠发布与部分成功
 
+
+
 ### 必读代码
 
 `internal/infrastructure/mq/rabbitmq/executor_client.go`：
@@ -153,7 +185,11 @@ go test -tags=integration ./internal/infrastructure/persistence/mysql -run "Test
 - `waitConfirms`：ack、nack、return、超时、连接关闭。
 - `reconnect`、`borrow`、`release`：断线恢复和 channel 生命周期。
 
+
+
 ### 面试高频追问
+
+
 
 #### Connection 和 Channel 为什么这样使用
 
@@ -170,6 +206,8 @@ Confirm ack 只表示交换机接收消息，不代表存在可消费路由。`m
 - 尚未收到确认的序号进入失败集合。
 - channel 标记为 broken，不放回池。
 - 上层状态回写保留部分成功，未决任务由 Outbox 负责恢复。
+
+
 
 #### 为什么发布前记录 GetNextPublishSeqNo
 
@@ -192,7 +230,11 @@ go test -tags=integration ./internal/infrastructure/mq/rabbitmq -run "TestClient
 2. 使用没有绑定的版本路由，确认进入 FailedIDs 而不是 SuccessIDs。
 3. 解释为什么不能只看 `PublishWithContext` 返回 nil。
 
+
+
 ## 五、主线四：request_id 幂等与状态竞争
+
+
 
 ### 必读代码
 
@@ -202,7 +244,11 @@ go test -tags=integration ./internal/infrastructure/mq/rabbitmq -run "TestClient
 4. `internal/infrastructure/persistence/mysql/po/execution_record_po.go`
 5. `internal/domain/vo/execution_status.go`
 
+
+
 ### 面试高频追问
+
+
 
 #### 幂等是怎么保证的
 
@@ -211,6 +257,8 @@ go test -tags=integration ./internal/infrastructure/mq/rabbitmq -run "TestClient
 3. 插入使用冲突忽略，再回读已经存在的记录。
 4. 已有状态不是 INIT 时直接返回原结果，不重新发布 MQ。
 5. MQ 消息使用 `execution_id` 作为 message_id，执行机继续做消费幂等。
+
+
 
 #### 为什么不能只在 Redis 里 SETNX
 
@@ -237,19 +285,25 @@ go test -tags=integration ./internal/infrastructure/persistence/mysql -run "Idem
 
 ## 六、主线五：取消、补偿和优雅停机
 
+
+
 ### 必读代码
 
 1. `internal/usecase/dispatch_app_service.go`
-   - channel 发送和 worker 循环中的 `ctx.Done()`。
-   - MQ 发布后的 `context.WithoutCancel + 5 秒超时`。
+  - channel 发送和 worker 循环中的 `ctx.Done()`。
+  - MQ 发布后的 `context.WithoutCancel + 5 秒超时`。
 2. `cmd/server/main.go`
-   - gRPC、Outbox、MQ、MySQL 的退出顺序。
+  - gRPC、Outbox、MQ、MySQL 的退出顺序。
 3. `internal/infrastructure/grpcserver/server.go`
-   - 健康检查与 `GracefulStop`。
+  - 健康检查与 `GracefulStop`。
 4. `internal/infrastructure/mq/rabbitmq/executor_client.go`
-   - `Close` 与重连竞争处理。
+  - `Close` 与重连竞争处理。
+
+
 
 ### 面试高频追问
+
+
 
 #### 客户端断开后为什么还要继续写数据库
 
@@ -266,6 +320,8 @@ go test -tags=integration ./internal/infrastructure/persistence/mysql -run "Idem
 - 然后关闭 MQ。
 - 最后关闭 MySQL，因为前面的收尾仍可能需要状态写回。
 
+
+
 ### 动手练习
 
 ```powershell
@@ -281,22 +337,24 @@ go test -race ./...
 测试代码比普通实体代码更能展示边界意识，建议按以下顺序阅读：
 
 1. `internal/usecase/dispatch_app_service_test.go`
-   - 取消后补偿。
-   - 部分发布成功。
-   - 状态写回错误可见。
-   - request_id 重试。
+  - 取消后补偿。
+  - 部分发布成功。
+  - 状态写回错误可见。
+  - request_id 重试。
 2. `internal/usecase/outbox_relay_test.go`
-   - 发布成功、退避重试、达到上限进入 DEAD。
+  - 发布成功、退避重试、达到上限进入 DEAD。
 3. `internal/infrastructure/persistence/mysql/outbox_repository_integration_test.go`
-   - 租约与旧令牌拒绝。
+  - 租约与旧令牌拒绝。
 4. `internal/infrastructure/persistence/mysql/execution_repository_integration_test.go`
-   - 幂等、状态防回退、缺失记录报错。
+  - 幂等、状态防回退、缺失记录报错。
 5. `internal/infrastructure/mq/rabbitmq/client_integration_test.go`
-   - 真正确认发布、无路由失败、Close 幂等。
+  - 真正确认发布、无路由失败、Close 幂等。
 
 面试官问“你怎么证明”时，不要只回答“我测过”，要能说出对应的测试场景、注入的故障和断言。
 
 ## 八、三张白板图必须会画
+
+
 
 ### 1. 系统边界图
 
@@ -318,56 +376,15 @@ Python Web → gRPC → Go 下发引擎 → MySQL / RabbitMQ → 执行机
 事务二：INIT → WAIT/FAILED + outbox terminal state
 ```
 
+
+
 ### 3. 批量并发拓扑
 
 ```text
 游标生产者 → 有界 batchCh → N 个 worker → progressCh → 单聚合器 → gRPC stream
 ```
 
+
+
 ## 九、90 分钟练习法
 
-### 前 30 分钟：只看 P0 文件
-
-- 顺着一个 case 从 gRPC 请求追到 MQ 消息和状态回写。
-- 在纸上画三张图。
-- 给每个跨系统边界标出可能失败的位置。
-
-### 中间 30 分钟：关闭代码口述
-
-每个问题控制在 2～3 分钟：
-
-1. 为什么拆 Go？
-2. 批量流水线如何控制内存和并发？
-3. DB/MQ 双写怎么处理？
-4. 为什么不是 exactly-once？
-5. Confirm 和 mandatory 分别解决什么？
-6. request_id、execution_id 各负责哪一层幂等？
-7. 执行机快速回调时如何防止状态回退？
-8. 客户端取消后为什么还要补偿写回？
-
-### 最后 30 分钟：跑边界测试
-
-```powershell
-go test ./internal/usecase -v
-go test -race ./...
-
-$env:TEST_MYSQL_DSN = 'root:123456@tcp(127.0.0.1:3307)/case_execution?parseTime=true&charset=utf8mb4&loc=Local'
-go test -tags=integration ./internal/infrastructure/persistence/mysql -count=1 -v
-
-$env:TEST_AMQP_URL = 'amqp://practice:practice@127.0.0.1:5673/'
-go test -tags=integration ./internal/infrastructure/mq/rabbitmq -count=1 -v
-```
-
-每跑完一个测试，强迫自己回答：测试制造了什么故障，如果没有这段实现会出现什么线上后果。
-
-## 十、2-1 回答标准
-
-### 只到 1-2 的讲法
-
-“我用 Go、gRPC、RabbitMQ 重写了 Python 下发，用 goroutine 提高了性能。”
-
-### 更符合 2-1 的讲法
-
-“我先定位到全量加载和 Pika 连接锁导致的串行瓶颈，再把稳定的下发边界抽成独立引擎；使用有界流水线控制资源，通过 Outbox 和消费幂等收敛 DB/MQ 一致性，并针对无路由、部分确认、客户端取消、状态竞争和多实例 Relay 逐一设计了恢复语义和测试证据。方案明确提供 at-least-once，不宣称 exactly-once。”
-
-2-1 的重点不是技术名词数量，而是能够从业务瓶颈推导设计、说明取舍、识别不可能保证的语义，并拿故障测试和真实数据证明结果。

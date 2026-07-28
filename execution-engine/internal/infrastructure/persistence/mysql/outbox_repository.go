@@ -57,6 +57,8 @@ func (r *OutboxRepository) BatchAdd(ctx context.Context, messages []*entity.Outb
 	for _, message := range messages {
 		executionIDs = append(executionIDs, message.ExecutionID)
 	}
+	// 批量幂等插入之后的回读，新插入的行：CreateInBatches 不一定可靠回填所有主键
+	// 已存在的行：冲突被忽略，内存里的 rows 没有库里的 outbox_id
 	var persisted []po.OutboxMessage
 	if err := db.Where("execution_id IN ?", executionIDs).Find(&persisted).Error; err != nil {
 		return fmt.Errorf("select idempotent dispatch_outbox batch: %w", err)

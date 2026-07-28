@@ -14,12 +14,12 @@ import (
 )
 
 type OutboxRelayConfig struct {
-	PollInterval   time.Duration
-	BatchSize      int
-	LeaseDuration  time.Duration
-	MaxAttempts    int
-	InitialBackoff time.Duration
-	MaxBackoff     time.Duration
+	PollInterval   time.Duration // 轮询间隔：Run 每隔多久跑一次 DispatchOnce
+	BatchSize      int           // 每轮最多认领多少条 PENDING 消息
+	LeaseDuration  time.Duration // 认领租约时长；处理中占用这段时间，超时后可被其他实例重新认领
+	MaxAttempts    int           // 单条消息最大重试次数；超过后标记为 DEAD / FAILED
+	InitialBackoff time.Duration // 首次失败后的初始退避时间
+	MaxBackoff     time.Duration // 指数退避上限，避免重试间隔无限变长
 }
 
 func (c OutboxRelayConfig) withDefaults() OutboxRelayConfig {

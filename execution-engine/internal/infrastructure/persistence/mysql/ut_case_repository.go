@@ -107,3 +107,5 @@ func (r *UtCaseRepository) scan(
 	}
 	return nil
 }
+
+// 明天搞明白这里！！！ 是怎么做到一批一批扫描，一批一批调用函数发的？

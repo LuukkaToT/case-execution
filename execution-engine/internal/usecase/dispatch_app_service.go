@@ -326,7 +326,7 @@ func (s *DispatchAppService) dispatchStream(
 		err := scan(gctx, s.cfg.BatchSize, func(batch []*entity.UtCase) error {
 			// 复制切片，避免底层分页实现复用 backing array 时与 worker 并发读取。
 			cases := make([]*entity.UtCase, len(batch))
-			copy(cases, batch)
+			copy(cases, batch) // 这里copy的效率？
 
 			select {
 			case <-gctx.Done():
