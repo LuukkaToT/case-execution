@@ -35,7 +35,7 @@ func TestToGRPCErr(t *testing.T) {
 		{"DeadlineExceeded", context.DeadlineExceeded, codes.DeadlineExceeded, false},
 		{"CaseNotExist", errs.NewCaseNotExist(1), codes.NotFound, false},
 		{"ExecutionNotFound", errs.NewExecutionNotFound(1), codes.NotFound, false},
-		{"IllegalStatusTransition", errs.NewIllegalStatusTransition(1, "INIT", "RUNNING"), codes.FailedPrecondition, false},
+		{"IllegalStatusTransition", errs.NewIllegalStatusTransition(1, "WAIT", "RUNNING"), codes.FailedPrecondition, false},
 		{"InvalidArgument", errs.NewInvalidArgument("bad"), codes.InvalidArgument, false},
 		{"Unknown", errors.New("some internal error"), codes.Internal, false},
 	}
@@ -64,8 +64,8 @@ func TestToPbDispatchStatus(t *testing.T) {
 		want pb.DispatchStatus
 	}{
 		{vo.StatusWait, pb.DispatchStatus_DISPATCH_STATUS_WAIT},
-		{vo.StatusFailed, pb.DispatchStatus_DISPATCH_STATUS_FAILED},
-		{vo.StatusInit, pb.DispatchStatus_DISPATCH_STATUS_UNSPECIFIED},
+		{vo.StatusDispatchFailed, pb.DispatchStatus_DISPATCH_STATUS_FAILED},
+		{vo.StatusFailed, pb.DispatchStatus_DISPATCH_STATUS_UNSPECIFIED},
 		{vo.StatusRunning, pb.DispatchStatus_DISPATCH_STATUS_UNSPECIFIED},
 		{vo.StatusSuccess, pb.DispatchStatus_DISPATCH_STATUS_UNSPECIFIED},
 	}

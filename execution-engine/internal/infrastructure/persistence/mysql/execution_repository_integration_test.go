@@ -114,7 +114,7 @@ func TestExecutionRepository_FindByID_Found(t *testing.T) {
 	assert.Equal(t, int64(200), got.CaseID)
 	assert.Equal(t, vo.Version("v2.0"), got.Version)
 	assert.Equal(t, "alice", got.CreateBy)
-	assert.Equal(t, vo.StatusInit, got.ExecutionStatus)
+	assert.Equal(t, vo.StatusWait, got.ExecutionStatus)
 }
 
 func TestExecutionRepository_FindByID_NotFound(t *testing.T) {
@@ -137,13 +137,14 @@ func TestExecutionRepository_Save(t *testing.T) {
 	r := newExecRecord(300, "v3.0", "bob")
 	require.NoError(t, repo.Add(ctx, r))
 
-	require.NoError(t, r.MarkAsWait())
+	require.NoError(t, r.MarkAsDispatchFailed())
 	require.NoError(t, repo.Save(ctx, r))
 
 	got, err := repo.FindByID(ctx, r.ExecutionID)
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	assert.Equal(t, vo.StatusWait, got.ExecutionStatus)
+	assert.Equal(t, vo.StatusDispatchFailed, got.ExecutionStatus)
+	assert.NotNil(t, got.FinishAt)
 }
 
 func TestExecutionRepository_Save_NoMatchingRow(t *testing.T) {
@@ -166,7 +167,7 @@ func TestExecutionRepository_Save_DoesNotRegressAdvancedState(t *testing.T) {
 		Where("execution_id = ?", r.ExecutionID).
 		Update("execution_status", string(vo.StatusSuccess)).Error)
 
-	require.NoError(t, r.MarkAsWait())
+	require.NoError(t, r.MarkAsDispatchFailed())
 	require.NoError(t, repo.Save(ctx, r))
 
 	got, err := repo.FindByID(ctx, r.ExecutionID)
@@ -189,19 +190,18 @@ func TestExecutionRepository_BatchUpdateStatus(t *testing.T) {
 	}
 	require.NoError(t, repo.BatchAdd(ctx, records))
 
-	require.NoError(t, records[0].MarkAsWait())
-	require.NoError(t, records[1].MarkAsFailed())
-	// records[2] 保持 INIT 状态，更新时应跳过。
+	require.NoError(t, records[1].MarkAsDispatchFailed())
+	// records[0]、records[2] 保持 WAIT，更新时应跳过。
 
 	require.NoError(t, repo.BatchUpdateStatus(ctx, records))
 
 	r0, _ := repo.FindByID(ctx, records[0].ExecutionID)
 	r1, _ := repo.FindByID(ctx, records[1].ExecutionID)
 	r2, _ := repo.FindByID(ctx, records[2].ExecutionID)
-	assert.Equal(t, vo.StatusWait, r0.ExecutionStatus)
-	assert.Equal(t, vo.StatusFailed, r1.ExecutionStatus)
+	assert.Equal(t, vo.StatusWait, r0.ExecutionStatus, "WAIT records must not be rewritten")
+	assert.Equal(t, vo.StatusDispatchFailed, r1.ExecutionStatus)
 	assert.NotNil(t, r1.FinishAt)
-	assert.Equal(t, vo.StatusInit, r2.ExecutionStatus, "StatusInit records must not be updated")
+	assert.Equal(t, vo.StatusWait, r2.ExecutionStatus, "WAIT records must not be updated")
 }
 
 func TestExecutionRepository_BatchUpdateStatus_记录缺失时返回错误(t *testing.T) {
@@ -210,7 +210,7 @@ func TestExecutionRepository_BatchUpdateStatus_记录缺失时返回错误(t *te
 
 	record := &entity.ExecutionRecord{
 		ExecutionID:     999999997,
-		ExecutionStatus: vo.StatusWait,
+		ExecutionStatus: vo.StatusDispatchFailed,
 	}
 	err := repo.BatchUpdateStatus(ctx, []*entity.ExecutionRecord{record})
 	require.Error(t, err)

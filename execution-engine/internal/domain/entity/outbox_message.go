@@ -58,3 +58,15 @@ func (m *OutboxMessage) Task() ExecutionTask {
 		Version:     m.Version,
 	}
 }
+
+// ReplayStatus 根据消息表状态回放下发结果。done=false 表示仍需由快速路径投递。
+func (m *OutboxMessage) ReplayStatus() (status vo.ExecutionStatus, done bool) {
+	switch m.State {
+	case OutboxDead:
+		return vo.StatusDispatchFailed, true
+	case OutboxPublished, OutboxProcessing:
+		return vo.StatusWait, true
+	default:
+		return "", false
+	}
+}

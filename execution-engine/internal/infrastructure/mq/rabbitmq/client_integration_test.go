@@ -109,7 +109,7 @@ func TestClient_Execute(t *testing.T) {
 		ExecutionID:     9001,
 		CaseID:          1,
 		Version:         vo.Version("v-exec"),
-		ExecutionStatus: vo.StatusInit,
+		ExecutionStatus: vo.StatusWait,
 	}
 	caseName := "ExecTestCase"
 

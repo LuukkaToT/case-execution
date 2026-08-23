@@ -16,17 +16,17 @@ func TestNewExecutionRecord(t *testing.T) {
 	assert.Equal(t, int64(10), r.CaseID)
 	assert.Equal(t, vo.Version("v1.0"), r.Version)
 	assert.Equal(t, "alice", r.CreateBy)
-	assert.Equal(t, vo.StatusInit, r.ExecutionStatus)
+	assert.Equal(t, vo.StatusWait, r.ExecutionStatus)
 	assert.Zero(t, r.ExecutionID)
 	assert.Nil(t, r.ExecuteAt)
 	assert.Nil(t, r.FinishAt)
 }
 
-func TestMarkAsWait(t *testing.T) {
+func TestMarkAsDispatchFailed(t *testing.T) {
 	r := NewExecutionRecord(1, vo.Version("v1"), "u")
-	require.NoError(t, r.MarkAsWait())
-	assert.Equal(t, vo.StatusWait, r.ExecutionStatus)
-	assert.Nil(t, r.FinishAt)
+	require.NoError(t, r.MarkAsDispatchFailed())
+	assert.Equal(t, vo.StatusDispatchFailed, r.ExecutionStatus)
+	assert.NotNil(t, r.FinishAt)
 }
 
 func TestMarkAsFailed(t *testing.T) {
@@ -38,33 +38,30 @@ func TestMarkAsFailed(t *testing.T) {
 
 func TestMarkAsRunning(t *testing.T) {
 	r := NewExecutionRecord(1, vo.Version("v1"), "u")
-	require.NoError(t, r.MarkAsWait())
 	require.NoError(t, r.MarkAsRunning())
 	assert.Equal(t, vo.StatusRunning, r.ExecutionStatus)
 	assert.NotNil(t, r.ExecuteAt)
 }
 
-func TestMarkAsWait_IllegalTransition(t *testing.T) {
-	r := NewExecutionRecord(1, vo.Version("v1"), "u")
-	require.NoError(t, r.MarkAsWait())
-	// WAIT 不能再次迁移到 WAIT。
-	err := r.MarkAsWait()
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, errs.ErrIllegalStatusTransition))
-}
-
 func TestMarkAsFailed_FromTerminal(t *testing.T) {
 	r := NewExecutionRecord(1, vo.Version("v1"), "u")
 	require.NoError(t, r.MarkAsFailed())
-	// FAILED 为终态，不能再次迁移到 FAILED。
 	err := r.MarkAsFailed()
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, errs.ErrIllegalStatusTransition))
 }
 
-func TestMarkAsRunning_IllegalFromInit(t *testing.T) {
+func TestMarkAsDispatchFailed_FromRunning(t *testing.T) {
 	r := NewExecutionRecord(1, vo.Version("v1"), "u")
-	// INIT 不能跳过 WAIT 直接迁移到 RUNNING。
+	require.NoError(t, r.MarkAsRunning())
+	err := r.MarkAsDispatchFailed()
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, errs.ErrIllegalStatusTransition))
+}
+
+func TestMarkAsRunning_IllegalFromFailed(t *testing.T) {
+	r := NewExecutionRecord(1, vo.Version("v1"), "u")
+	require.NoError(t, r.MarkAsFailed())
 	err := r.MarkAsRunning()
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, errs.ErrIllegalStatusTransition))

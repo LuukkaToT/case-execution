@@ -190,7 +190,7 @@ grpc_health_probe -addr 127.0.0.1:9090
 - 客户端能收到进度流。
 - MQ 队列收到对应消息。
 - 没有 NO_ROUTE、nack 或 confirm timeout。
-- 执行记录不长期停留在 INIT。
+- 执行记录不长期停留在未完成投递的 Outbox 状态。
 - Outbox 最终为 PUBLISHED，不出现 DEAD。
 
 ## 八、单次全量性能基准
@@ -312,11 +312,12 @@ FROM (
     HAVING COUNT(*) > 1
 ) duplicated;
 
-SELECT COUNT(*) AS stale_init
-FROM execution_record
-WHERE request_id = @request_id
-  AND execution_status = 'INIT'
-  AND create_at < NOW(3) - INTERVAL 15 SECOND;
+SELECT COUNT(*) AS stale_pending
+FROM dispatch_outbox o
+JOIN execution_record e ON e.execution_id = o.execution_id
+WHERE e.request_id = @request_id
+  AND o.state IN ('PENDING', 'PROCESSING')
+  AND o.create_at < NOW(3) - INTERVAL 15 SECOND;
 
 SELECT COUNT(*) AS stale_outbox
 FROM dispatch_outbox o
@@ -371,7 +372,7 @@ vmstat 1
 - 执行记录与 Outbox 写入数。
 - CPU、连接数、慢查询、磁盘 IO 和锁等待。
 - `ut_case` 游标扫描是否使用复合索引。
-- 是否存在超过 15 秒的 INIT、PENDING、PROCESSING。
+- 是否存在超过 15 秒的 PENDING、PROCESSING。
 
 ### RabbitMQ
 
@@ -396,7 +397,7 @@ vmstat 1
 - 客户端 failed=0、unresolved=0、没有 chunk error。
 - Outbox 最终全部 PUBLISHED。
 - 专用 MQ 队列接收的唯一 execution_id 数与计划数一致。
-- 没有长期 INIT/PENDING/PROCESSING/DEAD。
+- 没有长期 PENDING/PROCESSING/DEAD。
 - Go 进程不崩溃，内存不持续增长。
 - MySQL 与 RabbitMQ 没有资源报警。
 

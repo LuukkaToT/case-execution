@@ -34,6 +34,10 @@ func newFakeOutboxRepo(messages ...*entity.OutboxMessage) *fakeOutboxRepo {
 func (f *fakeOutboxRepo) Add(_ context.Context, message *entity.OutboxMessage) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if existing, ok := f.messages[message.ExecutionID]; ok {
+		*message = *existing
+		return nil
+	}
 	copyMessage := *message
 	f.messages[message.ExecutionID] = &copyMessage
 	return nil
@@ -97,7 +101,7 @@ func (f *fakeOutboxRepo) MarkDead(_ context.Context, ids []int64, _ string, last
 func seedFakeExecution(repo *fakeExecRepo, id int64) {
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
-	repo.records[id] = &entity.ExecutionRecord{ExecutionID: id, ExecutionStatus: "INIT"}
+	repo.records[id] = &entity.ExecutionRecord{ExecutionID: id, ExecutionStatus: vo.StatusWait}
 }
 
 func relayMessage(id int64, attempts int) *entity.OutboxMessage {
@@ -122,7 +126,7 @@ func TestOutboxRelay_确认成功后更新记录和Outbox(t *testing.T) {
 	require.NoError(t, relay.DispatchOnce(context.Background()))
 	stored, err := execRepo.FindByID(context.Background(), message.ExecutionID)
 	require.NoError(t, err)
-	assert.Equal(t, "WAIT", string(stored.ExecutionStatus))
+	assert.Equal(t, vo.StatusWait, stored.ExecutionStatus)
 	assert.Equal(t, entity.OutboxPublished, outbox.messages[message.ExecutionID].State)
 }
 
@@ -139,7 +143,7 @@ func TestOutboxRelay_未达到上限时退避重试(t *testing.T) {
 	require.NoError(t, relay.DispatchOnce(context.Background()))
 	stored, err := execRepo.FindByID(context.Background(), message.ExecutionID)
 	require.NoError(t, err)
-	assert.Equal(t, "INIT", string(stored.ExecutionStatus))
+	assert.Equal(t, vo.StatusWait, stored.ExecutionStatus)
 	assert.Equal(t, entity.OutboxPending, outbox.messages[message.ExecutionID].State)
 	assert.True(t, outbox.messages[message.ExecutionID].AvailableAt.After(fixedNow))
 }
@@ -155,7 +159,7 @@ func TestOutboxRelay_达到上限后进入死信状态(t *testing.T) {
 	require.NoError(t, relay.DispatchOnce(context.Background()))
 	stored, err := execRepo.FindByID(context.Background(), message.ExecutionID)
 	require.NoError(t, err)
-	assert.Equal(t, "FAILED", string(stored.ExecutionStatus))
+	assert.Equal(t, vo.StatusDispatchFailed, stored.ExecutionStatus)
 	assert.NotNil(t, stored.FinishAt)
 	assert.Equal(t, entity.OutboxDead, outbox.messages[message.ExecutionID].State)
 }
@@ -185,7 +189,7 @@ func TestDispatchAppService_发布失败时Outbox进入死信(t *testing.T) {
 
 	executionID, status, err := svc.ExecuteCaseWithRequest(context.Background(), "req-outbox-failed", 1, "v1", "user")
 	require.NoError(t, err)
-	assert.Equal(t, vo.StatusFailed, status)
+	assert.Equal(t, vo.StatusDispatchFailed, status)
 	require.NotNil(t, outbox.messages[executionID])
 	assert.Equal(t, entity.OutboxDead, outbox.messages[executionID].State)
 }

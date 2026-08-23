@@ -16,7 +16,7 @@ type ExecutionService struct{}
 // New 返回零值领域服务，保留构造器以统一依赖注入形式。
 func New() *ExecutionService { return &ExecutionService{} }
 
-// CreateExecutionRecord 创建一条 INIT 状态的新聚合。
+// CreateExecutionRecord 创建一条 WAIT 状态的新聚合。
 func (s *ExecutionService) CreateExecutionRecord(caseID int64, v vo.Version, user string) *entity.ExecutionRecord {
 	return entity.NewExecutionRecord(caseID, v, user)
 }
@@ -41,31 +41,25 @@ func (s *ExecutionService) CreateBatchRecordsForRequest(requestID string, cases 
 	return records, nameMap
 }
 
-// DispatchBatch 根据 MQ 客户端返回的 BatchResult，把记录从 INIT 迁移到
-// 对应状态。两个结果分区都不存在的记录保持不变，留给独立修复流程处理。
+// DispatchBatch 根据 MQ 客户端返回的 BatchResult，把确定投递失败的记录从
+// WAIT 迁移到 DISPATCH_FAILED。发布成功的记录保持 WAIT，投递进度由 Outbox
+// 维护。两个结果分区都不存在的记录也保持 WAIT，留给 Relay 修复。
 //
-// 非法迁移只记录日志而不向上返回：按正常流程记录进入本方法时应为 INIT，
+// 非法迁移只记录日志而不向上返回：按正常流程记录进入本方法时应为 WAIT，
 // 非法迁移意味着调用方缺陷，不应因此中断整个分片。
 func (s *ExecutionService) DispatchBatch(records []*entity.ExecutionRecord, result vo.BatchResult) {
-	success := make(map[int64]struct{}, len(result.SuccessIDs))
 	failed := make(map[int64]struct{}, len(result.FailedIDs))
-	for _, id := range result.SuccessIDs {
-		success[id] = struct{}{}
-	}
 	for _, id := range result.FailedIDs {
 		failed[id] = struct{}{}
 	}
 	for _, r := range records {
-		var transitErr error
-		if _, ok := failed[r.ExecutionID]; ok {
-			transitErr = r.MarkAsFailed()
-		} else if _, ok := success[r.ExecutionID]; ok {
-			transitErr = r.MarkAsWait()
+		if _, ok := failed[r.ExecutionID]; !ok {
+			continue
 		}
-		if transitErr != nil {
+		if err := r.MarkAsDispatchFailed(); err != nil {
 			logger.L().Warn("illegal status transition during dispatch",
 				zap.Int64("execution_id", r.ExecutionID),
-				zap.Error(transitErr))
+				zap.Error(err))
 		}
 	}
 }

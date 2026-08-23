@@ -16,7 +16,7 @@ func TestCreateExecutionRecord(t *testing.T) {
 	assert.Equal(t, int64(5), r.CaseID)
 	assert.Equal(t, vo.Version("v2.0"), r.Version)
 	assert.Equal(t, "bob", r.CreateBy)
-	assert.Equal(t, vo.StatusInit, r.ExecutionStatus)
+	assert.Equal(t, vo.StatusWait, r.ExecutionStatus)
 }
 
 func TestCreateBatchRecords(t *testing.T) {
@@ -31,7 +31,7 @@ func TestCreateBatchRecords(t *testing.T) {
 	assert.Equal(t, "Alpha", nameMap[1])
 	assert.Equal(t, "Beta", nameMap[2])
 	for _, r := range records {
-		assert.Equal(t, vo.StatusInit, r.ExecutionStatus)
+		assert.Equal(t, vo.StatusWait, r.ExecutionStatus)
 	}
 }
 
@@ -51,7 +51,7 @@ func TestDispatchBatch_AllFailed(t *testing.T) {
 	result := vo.BatchResult{FailedIDs: []int64{1, 2, 3}}
 	svc.DispatchBatch(records, result)
 	for _, r := range records {
-		assert.Equal(t, vo.StatusFailed, r.ExecutionStatus)
+		assert.Equal(t, vo.StatusDispatchFailed, r.ExecutionStatus)
 	}
 }
 
@@ -64,7 +64,7 @@ func TestDispatchBatch_Mixed(t *testing.T) {
 	}
 	svc.DispatchBatch(records, result)
 	assert.Equal(t, vo.StatusWait, records[0].ExecutionStatus)
-	assert.Equal(t, vo.StatusFailed, records[1].ExecutionStatus)
+	assert.Equal(t, vo.StatusDispatchFailed, records[1].ExecutionStatus)
 	assert.Equal(t, vo.StatusWait, records[2].ExecutionStatus)
 }
 
@@ -75,7 +75,7 @@ func TestDispatchBatch_UnknownIDUnchanged(t *testing.T) {
 	result := vo.BatchResult{SuccessIDs: []int64{99}, FailedIDs: []int64{100}}
 	svc.DispatchBatch(records, result)
 	for _, r := range records {
-		assert.Equal(t, vo.StatusInit, r.ExecutionStatus)
+		assert.Equal(t, vo.StatusWait, r.ExecutionStatus)
 	}
 }
 

@@ -122,7 +122,7 @@ func (r *ExecutionRepository) FindByID(ctx context.Context, executionID int64) (
 func (r *ExecutionRepository) Save(ctx context.Context, record *entity.ExecutionRecord) error {
 	db := FromCtx(ctx, r.root)
 	res := db.Model(&po.ExecutionRecord{}).
-		Where("execution_id = ? AND execution_status = ?", record.ExecutionID, string(vo.StatusInit)).
+		Where("execution_id = ? AND execution_status = ?", record.ExecutionID, string(vo.StatusWait)).
 		Updates(map[string]any{
 			"execution_status": string(record.ExecutionStatus),
 			"execute_at":       record.ExecuteAt,
@@ -132,7 +132,7 @@ func (r *ExecutionRepository) Save(ctx context.Context, record *entity.Execution
 		return fmt.Errorf("update execution_record: %w", res.Error)
 	}
 	if res.RowsAffected == 0 {
-		// 发布确认到状态回写之间，执行机可能已把 INIT 推进到 RUNNING/SUCCESS。
+		// 下发回写 DISPATCH_FAILED 之前，执行机可能已把 WAIT 推进到 RUNNING/SUCCESS。
 		// 此时视为成功，不回退状态，也不返回误导性的未找到错误。
 		var existing po.ExecutionRecord
 		err := db.Select("execution_id").First(&existing, record.ExecutionID).Error
@@ -147,18 +147,18 @@ func (r *ExecutionRepository) Save(ctx context.Context, record *entity.Execution
 }
 
 // BatchUpdateStatus 按目标状态分组，每种状态最多执行一条 UPDATE。下发流水线
-// 实际只写 WAIT 或 FAILED，因此一个分片最多两条 SQL。更新条件限定为 INIT，
-// 防止快速执行机回调后的 RUNNING/SUCCESS 被回退；FAILED 同时持久化 finish_at。
+// 实际只把确定失败的记录写成 DISPATCH_FAILED，成功记录保持创建时的 WAIT。更新条件
+// 限定为 WAIT，防止快速执行机回调后的 RUNNING/SUCCESS 被回退；DISPATCH_FAILED 同时
+// 持久化 finish_at。
 func (r *ExecutionRepository) BatchUpdateStatus(ctx context.Context, records []*entity.ExecutionRecord) error {
 	if len(records) == 0 {
 		return nil
 	}
 	db := FromCtx(ctx, r.root)
-	grouped := make(map[vo.ExecutionStatus][]int64, 2)
+	grouped := make(map[vo.ExecutionStatus][]int64, 1)
 	for _, rec := range records {
-		// INIT 表示 DispatchBatch 未分配下发结果，即 execution_id 不在成功或
-		// 失败分区中；这类记录跳过，由 Outbox relay 负责修复。
-		if rec.ExecutionStatus == vo.StatusInit {
+		// WAIT 表示无需改写执行记录；投递进度由 Outbox 维护，Relay 负责补偿。
+		if rec.ExecutionStatus == vo.StatusWait {
 			continue
 		}
 		grouped[rec.ExecutionStatus] = append(grouped[rec.ExecutionStatus], rec.ExecutionID)
@@ -169,7 +169,7 @@ func (r *ExecutionRepository) BatchUpdateStatus(ctx context.Context, records []*
 			updates["finish_at"] = recordFinishTime(records, ids)
 		}
 		result := db.Model(&po.ExecutionRecord{}).
-			Where("execution_id IN ? AND execution_status = ?", ids, string(vo.StatusInit)).
+			Where("execution_id IN ? AND execution_status = ?", ids, string(vo.StatusWait)).
 			Updates(updates)
 		if result.Error != nil {
 			return fmt.Errorf("bulk update execution_status=%s: %w", status, result.Error)

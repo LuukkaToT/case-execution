@@ -125,7 +125,7 @@ func toPbDispatchStatus(s vo.ExecutionStatus) pb.DispatchStatus {
 	switch s {
 	case vo.StatusWait:
 		return pb.DispatchStatus_DISPATCH_STATUS_WAIT
-	case vo.StatusFailed:
+	case vo.StatusDispatchFailed:
 		return pb.DispatchStatus_DISPATCH_STATUS_FAILED
 	default:
 		return pb.DispatchStatus_DISPATCH_STATUS_UNSPECIFIED

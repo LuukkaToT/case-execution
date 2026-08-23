@@ -25,7 +25,7 @@ P0 文件不是要求逐行背诵，而是关闭编辑器后仍能画出数据�
 | 主题      | 文件                                                                | 要点                                     |
 | ------- | ----------------------------------------------------------------- | -------------------------------------- |
 | 游标扫描    | `internal/infrastructure/persistence/mysql/ut_case_repository.go` | `FindInBatches`、复合索引、有界内存              |
-| 状态机     | `internal/domain/vo/execution_status.go`                          | INIT、WAIT、RUNNING、SUCCESS、FAILED 的合法迁移 |
+| 状态机     | `internal/domain/vo/execution_status.go`                          | WAIT、RUNNING、SUCCESS、FAILED、DISPATCH_FAILED 的合法迁移 |
 | 执行记录聚合  | `internal/domain/entity/execution_record.go`                      | 状态转换和时间字段                              |
 | gRPC 适配 | `internal/infrastructure/grpcserver/handler.go`                   | 参数校验、错误码映射、单协程发送进度                     |
 | 服务生命周期  | `cmd/server/main.go`                                              | 依赖装配、Relay 启动、退出顺序                     |
@@ -255,7 +255,7 @@ go test -tags=integration ./internal/infrastructure/mq/rabbitmq -run "TestClient
 1. Python Web 为一次业务下发生成 `request_id`，网络重试复用。
 2. 数据库唯一键 `(request_id, case_id)` 是最终并发防线。
 3. 插入使用冲突忽略，再回读已经存在的记录。
-4. 已有状态不是 INIT 时直接返回原结果，不重新发布 MQ。
+4. Outbox 已是 PUBLISHED、PROCESSING 或 DEAD 时直接返回原结果，不重新发布 MQ。
 5. MQ 消息使用 `execution_id` 作为 message_id，执行机继续做消费幂等。
 
 
@@ -264,9 +264,9 @@ go test -tags=integration ./internal/infrastructure/mq/rabbitmq -run "TestClient
 
 Redis 锁过期、缓存丢失或 DB 提交失败会引入新的双写问题。数据库唯一键与执行记录在同一个事实源中，能处理真正的并发插入竞争。Redis 可以做前置削峰，但不能替代数据库约束。
 
-#### 为什么状态更新带 WHERE status=INIT
+#### 为什么状态更新带 WHERE status=WAIT
 
-执行机可能非常快，在下发引擎写 WAIT 前，已经通过 Python Web 把状态推进到 RUNNING/SUCCESS。如果直接 UPDATE，会把更后的状态回退为 WAIT。条件更新只允许 INIT 推进；未命中后检查记录是否存在，存在说明已被合法推进，不视为失败。
+执行机可能非常快，在下发引擎把失败写回 DISPATCH_FAILED 前，已经通过 Python Web 把状态推进到 RUNNING/SUCCESS。如果直接 UPDATE，会把更后的状态回退为 DISPATCH_FAILED。条件更新只允许 WAIT 推进；未命中后检查记录是否存在，存在说明已被合法推进，不视为失败。投递进度由 Outbox 维护，成功路径不再改写执行记录状态。
 
 #### 同一 request_id 被错误用于不同版本怎么办
 
@@ -307,7 +307,7 @@ go test -tags=integration ./internal/infrastructure/persistence/mysql -run "Idem
 
 #### 客户端断开后为什么还要继续写数据库
 
-如果 MQ 已经确认，消息可能立即被执行机消费。此时继续使用已经取消的 RPC context，会导致执行记录停在 INIT。代码保留原请求 values，但去掉取消信号，并设置独立 5 秒超时完成补偿写回。
+如果 MQ 已经确认，消息可能立即被执行机消费。此时继续使用已经取消的 RPC context，会导致 Outbox 停在 PENDING。代码保留原请求 values，但去掉取消信号，并设置独立 5 秒超时完成补偿写回。
 
 #### 为什么不能所有阶段都用 WithoutCancel
 
@@ -373,7 +373,7 @@ Python Web → gRPC → Go 下发引擎 → MySQL / RabbitMQ → 执行机
                 ↓
 事务外：RabbitMQ publish + return/confirm
                 ↓
-事务二：INIT → WAIT/FAILED + outbox terminal state
+事务二：失败时 WAIT → DISPATCH_FAILED；Outbox 写 PUBLISHED/DEAD
 ```
 
 

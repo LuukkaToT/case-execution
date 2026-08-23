@@ -7,9 +7,10 @@ import (
 	"execution-engine/internal/domain/vo"
 )
 
-// ExecutionRecord 是一次单用例下发尝试的聚合根。下发引擎负责 INIT 到
-// WAIT/FAILED 的迁移，随后由执行机回调 Python Web 完成 WAIT 到
-// RUNNING/SUCCESS/FAILED 的迁移。
+// ExecutionRecord 是一次单用例下发尝试的聚合根。新记录直接以 WAIT 落库，
+// 表示等待执行机处理；消息投递进度由 Outbox 维护。下发确定失败时迁移到
+// DISPATCH_FAILED。业务执行结果 RUNNING/SUCCESS/FAILED 由执行机回调
+// Python Web 写入。
 type ExecutionRecord struct {
 	ExecutionID     int64
 	RequestID       string
@@ -23,7 +24,7 @@ type ExecutionRecord struct {
 }
 
 // NewExecutionRecord 是与 Python ExecutionRecord.create 对应的领域工厂。
-// 新记录从 INIT 开始，数据库主键在仓储插入后回填。
+// 新记录从 WAIT 开始，数据库主键在仓储插入后回填。
 func NewExecutionRecord(caseID int64, v vo.Version, user string) *ExecutionRecord {
 	return NewExecutionRecordForRequest("", caseID, v, user)
 }
@@ -34,17 +35,18 @@ func NewExecutionRecordForRequest(requestID string, caseID int64, v vo.Version, 
 		CaseID:          caseID,
 		Version:         v,
 		CreateBy:        user,
-		ExecutionStatus: vo.StatusInit,
+		ExecutionStatus: vo.StatusWait,
 		CreateAt:        time.Now(),
 	}
 }
 
-// MarkAsWait 按状态机约束迁移到 WAIT。
-func (r *ExecutionRecord) MarkAsWait() error {
-	return r.transit(vo.StatusWait)
+// MarkAsDispatchFailed 按下发失败迁移到 DISPATCH_FAILED。仅下发引擎调用。
+func (r *ExecutionRecord) MarkAsDispatchFailed() error {
+	return r.transit(vo.StatusDispatchFailed)
 }
 
-// MarkAsFailed 按状态机约束迁移到 FAILED。
+// MarkAsFailed 按状态机约束迁移到业务失败 FAILED。该方法用于保持模型完整，
+// 下发引擎本身不会调用。
 func (r *ExecutionRecord) MarkAsFailed() error {
 	return r.transit(vo.StatusFailed)
 }

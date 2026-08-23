@@ -17,7 +17,7 @@ type OutboxRelayConfig struct {
 	PollInterval   time.Duration // 轮询间隔：Run 每隔多久跑一次 DispatchOnce
 	BatchSize      int           // 每轮最多认领多少条 PENDING 消息
 	LeaseDuration  time.Duration // 认领租约时长；处理中占用这段时间，超时后可被其他实例重新认领
-	MaxAttempts    int           // 单条消息最大重试次数；超过后标记为 DEAD / FAILED
+	MaxAttempts    int           // 单条消息最大重试次数；超过后标记为 DEAD / DISPATCH_FAILED
 	InitialBackoff time.Duration // 首次失败后的初始退避时间
 	MaxBackoff     time.Duration // 指数退避上限，避免重试间隔无限变长
 }
@@ -121,12 +121,7 @@ func (r *OutboxRelay) DispatchOnce(ctx context.Context) error {
 	messageByID := make(map[int64]*entity.OutboxMessage, len(messages))
 	for _, message := range messages {
 		tasks = append(tasks, message.Task())
-		records = append(records, &entity.ExecutionRecord{
-			ExecutionID:     message.ExecutionID,
-			CaseID:          message.CaseID,
-			Version:         message.Version,
-			ExecutionStatus: vo.StatusInit,
-		})
+		records = append(records, &entity.ExecutionRecord{ExecutionID: message.ExecutionID})
 		messageByID[message.ExecutionID] = message
 	}
 
@@ -139,20 +134,7 @@ func (r *OutboxRelay) DispatchOnce(ctx context.Context) error {
 		result.ErrorMessage = "outbox publish was not confirmed"
 	}
 
-	successRecords := make([]*entity.ExecutionRecord, 0, len(result.SuccessIDs))
-	for _, id := range result.SuccessIDs {
-		message := messageByID[id]
-		record := &entity.ExecutionRecord{ExecutionID: id, ExecutionStatus: vo.StatusInit}
-		if message != nil {
-			record.CaseID = message.CaseID
-			record.Version = message.Version
-		}
-		if err := record.MarkAsWait(); err != nil {
-			return fmt.Errorf("mark relayed execution %d WAIT: %w", id, err)
-		}
-		successRecords = append(successRecords, record)
-	}
-
+	successIDs := result.SuccessIDs
 	var retryIDs, deadIDs []int64
 	deadRecords := make([]*entity.ExecutionRecord, 0)
 	maxAttempt := 1
@@ -172,21 +154,20 @@ func (r *OutboxRelay) DispatchOnce(ctx context.Context) error {
 			ExecutionID:     id,
 			CaseID:          message.CaseID,
 			Version:         message.Version,
-			ExecutionStatus: vo.StatusInit,
+			ExecutionStatus: vo.StatusWait,
 		}
-		if err := record.MarkAsFailed(); err != nil {
-			return fmt.Errorf("mark exhausted execution %d FAILED: %w", id, err)
+		if err := record.MarkAsDispatchFailed(); err != nil {
+			return fmt.Errorf("mark exhausted execution %d DISPATCH_FAILED: %w", id, err)
 		}
 		deadRecords = append(deadRecords, record)
 		deadIDs = append(deadIDs, id)
 	}
 
-	allTerminalRecords := append(successRecords, deadRecords...)
 	return r.tx.Do(ctx, func(ctx context.Context) error {
-		if err := r.execRepo.BatchUpdateStatus(ctx, allTerminalRecords); err != nil {
+		if err := r.execRepo.BatchUpdateStatus(ctx, deadRecords); err != nil {
 			return err
 		}
-		if err := r.outbox.MarkPublished(ctx, result.SuccessIDs, leaseToken, now); err != nil {
+		if err := r.outbox.MarkPublished(ctx, successIDs, leaseToken, now); err != nil {
 			return err
 		}
 		if err := r.outbox.MarkDead(ctx, deadIDs, leaseToken, result.ErrorMessage); err != nil {

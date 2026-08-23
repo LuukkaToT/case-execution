@@ -28,7 +28,7 @@ flowchart LR
 - 至少一次投递：RabbitMQ 使用持久化消息、Publisher Confirm 和 `mandatory` 路由检查；消费者必须按 `execution_id` 去重。
 - 部分成功语义：批量发布中断时保留已经确认的成功集合，仅把 nack、无路由、超时和未决消息归入失败集合。
 - 多实例安全：Outbox 使用 `FOR UPDATE SKIP LOCKED`、租约和随机租约令牌，旧实例不能覆盖新实例的处理结果。
-- 状态防回退：下发侧只允许 INIT 推进为 WAIT/FAILED；如果执行机已经回写更后面的状态，不会被迟到的下发回写覆盖。
+- 状态防回退：下发侧只允许 WAIT 推进为 DISPATCH_FAILED；如果执行机已经回写更后面的状态，不会被迟到的下发回写覆盖。投递进度由 `dispatch_outbox` 维护。业务执行失败仍是 `FAILED`，由执行机回调写入。
 - 有界并发与取消传播：限制单请求工作协程数和全局批量 RPC 数；客户端断开会取消扫描和发布，已完成 MQ 发布后的状态补偿使用独立短超时上下文。
 - 标准健康检查与结构化日志：注册 gRPC Health 服务，优雅停机时先摘除健康状态，再按 gRPC、Outbox、RabbitMQ、MySQL 的顺序收尾。
 

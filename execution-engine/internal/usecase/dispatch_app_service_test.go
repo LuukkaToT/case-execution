@@ -281,11 +281,11 @@ func TestExecuteCase_MQFailure(t *testing.T) {
 	id, status, err := svc.ExecuteCase(context.Background(), 1, vo.Version("v1"), "u")
 	require.NoError(t, err)
 	assert.Greater(t, id, int64(0))
-	assert.Equal(t, vo.StatusFailed, status)
+	assert.Equal(t, vo.StatusDispatchFailed, status)
 
 	stored, _ := execRepo.FindByID(context.Background(), id)
 	require.NotNil(t, stored)
-	assert.Equal(t, vo.StatusFailed, stored.ExecutionStatus)
+	assert.Equal(t, vo.StatusDispatchFailed, stored.ExecutionStatus)
 }
 
 func TestExecuteCase_ClientCancelAfterPublishStillWritesStatus(t *testing.T) {
@@ -314,7 +314,7 @@ func TestExecuteCaseWithRequest_重试复用原记录且不重复发布(t *testi
 	}}
 	execRepo := newFakeExecRepo()
 	executor := &fakeExecutor{}
-	svc := newService(caseRepo, execRepo, executor)
+	svc := newService(caseRepo, execRepo, executor).WithOutbox(newFakeOutboxRepo())
 
 	firstID, firstStatus, err := svc.ExecuteCaseWithRequest(context.Background(), "req-single-1", 1, vo.Version("v1"), "u")
 	require.NoError(t, err)
@@ -399,7 +399,7 @@ func TestExecuteAllCases_PartialPublishErrorPreservesConfirmedIDs(t *testing.T) 
 	failed, findErr := execRepo.FindByID(context.Background(), progress.FailedIDs[0])
 	require.NoError(t, findErr)
 	assert.Equal(t, vo.StatusWait, succeeded.ExecutionStatus)
-	assert.Equal(t, vo.StatusFailed, failed.ExecutionStatus)
+	assert.Equal(t, vo.StatusDispatchFailed, failed.ExecutionStatus)
 }
 
 func TestExecuteAllCases_WriteBackErrorIsVisibleInProgress(t *testing.T) {
@@ -408,7 +408,7 @@ func TestExecuteAllCases_WriteBackErrorIsVisibleInProgress(t *testing.T) {
 	}}
 	execRepo := newFakeExecRepo()
 	execRepo.batchUpdateErr = errors.New("mysql unavailable")
-	svc := newService(caseRepo, execRepo, &fakeExecutor{})
+	svc := newService(caseRepo, execRepo, &fakeExecutor{batchRunErr: errors.New("broker down")})
 
 	var progress Progress
 	err := svc.ExecuteAllCases(context.Background(), vo.Version("v1"), "u", func(p Progress) error {
@@ -426,7 +426,7 @@ func TestExecuteAllCasesWithRequest_重试不重复批量发布(t *testing.T) {
 	}}
 	execRepo := newFakeExecRepo()
 	executor := &fakeExecutor{}
-	svc := newService(caseRepo, execRepo, executor)
+	svc := newService(caseRepo, execRepo, executor).WithOutbox(newFakeOutboxRepo())
 
 	for i := 0; i < 2; i++ {
 		err := svc.ExecuteAllCasesWithRequest(context.Background(), "req-batch-1", vo.Version("v1"), "u", func(Progress) error {

@@ -11,7 +11,7 @@ package taskexecution.v1;
 option go_package = "execution-engine/api/gen/taskexecution/v1;taskexecutionv1";
 
 service TaskExecutionService {
-  // 单用例下发：创建执行记录、发布 MQ，并回写 WAIT/FAILED 状态。
+  // 单用例下发：创建执行记录、发布 MQ，并回写 WAIT / DISPATCH_FAILED。
   rpc ExecuteCase(ExecuteCaseRequest) returns (ExecuteCaseResponse);
 
   // 按 BATCH_SIZE 分片下发指定版本的全部用例；每完成一个分片返回一帧进度。
@@ -23,8 +23,8 @@ service TaskExecutionService {
 }
 
 // DispatchStatus 只表示“下发结果”，不表示用例最终执行结果。WAIT 表示消息已
-// 成功发布并收到确认，FAILED 表示下发失败。SUCCESS/FAILED 等执行机结果仍
-// 由执行机回调 Python Web 写入，不属于本引擎职责。
+// 成功发布并收到确认，FAILED 表示下发失败。业务侧 SUCCESS/FAILED 由执行机
+// 回调 Python Web 写入，不属于本引擎职责。
 enum DispatchStatus {
   DISPATCH_STATUS_UNSPECIFIED = 0;
   DISPATCH_STATUS_WAIT        = 1;

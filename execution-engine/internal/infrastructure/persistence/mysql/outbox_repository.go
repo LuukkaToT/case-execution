@@ -34,9 +34,7 @@ func (r *OutboxRepository) Add(ctx context.Context, message *entity.OutboxMessag
 	if err := db.Where("execution_id = ?", message.ExecutionID).First(row).Error; err != nil {
 		return fmt.Errorf("select idempotent dispatch_outbox: %w", err)
 	}
-	message.OutboxID = row.OutboxID
-	message.CreatedAt = row.CreatedAt
-	message.UpdatedAt = row.UpdatedAt
+	copyOutboxMessage(message, row.ToEntity())
 	return nil
 }
 
@@ -72,11 +70,13 @@ func (r *OutboxRepository) BatchAdd(ctx context.Context, messages []*entity.Outb
 		if row == nil {
 			return fmt.Errorf("select idempotent dispatch_outbox batch: execution_id=%d missing", message.ExecutionID)
 		}
-		message.OutboxID = row.OutboxID
-		message.CreatedAt = row.CreatedAt
-		message.UpdatedAt = row.UpdatedAt
+		copyOutboxMessage(message, row.ToEntity())
 	}
 	return nil
+}
+
+func copyOutboxMessage(dst, src *entity.OutboxMessage) {
+	*dst = *src
 }
 
 // ClaimPending 在短事务内跳过其他实例持有的行，领取到期 PENDING 或租约过期 PROCESSING 消息。

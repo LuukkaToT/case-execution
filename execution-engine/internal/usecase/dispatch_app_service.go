@@ -97,13 +97,13 @@ func NewDispatchAppService(
 // ---------------------------------------------------------------------------
 
 // ExecuteCase 的执行步骤：
-//  1. 事务内读取 UtCase、创建并保存 ExecutionRecord、回填主键。
+//  1. 事务内读取 UtCase、创建 WAIT 状态的 ExecutionRecord 和 PENDING Outbox。
 //  2. 向 MQ 发布一条任务。
-//  3. 事务内重新读取记录，根据 MQ 结果更新为 WAIT 或 FAILED。
+//  3. 事务内根据 MQ 结果更新 Outbox；仅在确定失败时把执行记录标为 DISPATCH_FAILED。
 //
 // 返回执行记录 ID 和下发阶段状态，使 Python Web 无需再次查询。三个阶段均
 // 响应 ctx；第二阶段完成后即使调用方取消，也会用独立补偿上下文尽力完成
-// 第三阶段，避免记录长期停留在 INIT。
+// 第三阶段，避免消息表长期停留在 PENDING。
 func (s *DispatchAppService) ExecuteCase(ctx context.Context, caseID int64, v vo.Version, user string) (int64, vo.ExecutionStatus, error) {
 	return s.ExecuteCaseWithRequest(ctx, "", caseID, v, user)
 }
@@ -124,8 +124,9 @@ func (s *DispatchAppService) ExecuteCaseWithRequest(
 	}
 
 	var (
-		record   *entity.ExecutionRecord
-		caseName string
+		record    *entity.ExecutionRecord
+		caseName  string
+		outboxMsg *entity.OutboxMessage
 	)
 
 	// 阶段一：校验用例存在，并写入执行记录和 Outbox。
@@ -143,8 +144,8 @@ func (s *DispatchAppService) ExecuteCaseWithRequest(
 			return err
 		}
 		if s.outboxRepo != nil {
-			message := entity.NewOutboxMessage(record, caseName, time.Now().Add(s.cfg.OutboxFastPathGrace))
-			if err := s.outboxRepo.Add(ctx, message); err != nil {
+			outboxMsg = entity.NewOutboxMessage(record, caseName, time.Now().Add(s.cfg.OutboxFastPathGrace))
+			if err := s.outboxRepo.Add(ctx, outboxMsg); err != nil {
 				return err
 			}
 		}
@@ -156,14 +157,10 @@ func (s *DispatchAppService) ExecuteCaseWithRequest(
 		return record.ExecutionID, "", errs.NewInvalidArgument("request_id was already used with a different version")
 	}
 
-	// 🚩这里校验状态是为了防止，这是客户端的重试请求，即服务端执行完逻辑回复给客户端
-	// 客户端没收到响应所以重试了。前面的Add方法会校验requestId，如果是重复的请求，会将
-	// 之前的record写回， 这里通过判断状态就能确定是否为重试
-	if record.ExecutionStatus != vo.StatusInit {
-		if record.ExecutionStatus == vo.StatusFailed {
-			return record.ExecutionID, vo.StatusFailed, nil
-		}
-		return record.ExecutionID, vo.StatusWait, nil
+	// 客户端超时重试会带上同一个 request_id。Add 因唯一键冲突回读已有记录；
+	// 投递是否完成看出箱状态，不再占用执行记录状态。
+	if status, done := replayDispatchedStatus(outboxMsg, record); done {
+		return record.ExecutionID, status, nil
 	}
 
 	// 1. 🚩如果此处发生服务宕机mq还没发 , relay会再发一次, 这是异常情况的兜底
@@ -180,39 +177,37 @@ func (s *DispatchAppService) ExecuteCaseWithRequest(
 	// 2. 🚩如果此处发生服务宕机，Relay无法判断是否发过消息，会再发一次，所以这里的语义是 at-least-once
 	// 至少会投递一次
 
-	// 阶段三：根据发布结果更新状态。MQ 发布完成后，不能让 RPC 客户端断开
-	// 阻止结果持久化，因此保留请求级 values，但为补偿写入提供独立超时。
+	// 阶段三：根据发布结果更新 Outbox；仅失败时改写执行记录。MQ 发布完成后，
+	// 不能让 RPC 客户端断开阻止结果持久化，因此保留请求级 values，但为补偿
+	// 写入提供独立超时。
 	finalStatus := vo.StatusWait
 	if mqErr != nil {
-		finalStatus = vo.StatusFailed
+		finalStatus = vo.StatusDispatchFailed
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := s.tx.Do(writeCtx, func(ctx context.Context) error {
-		cur, err := s.execRepo.FindByID(ctx, record.ExecutionID)
-		if err != nil {
-			return err
-		}
-		if cur == nil {
-			return errs.NewExecutionNotFound(record.ExecutionID)
-		}
-		var transitErr error
 		if mqErr != nil {
-			transitErr = cur.MarkAsFailed()
-		} else {
-			transitErr = cur.MarkAsWait()
-		}
-		if transitErr != nil {
-			return transitErr
-		}
-		if err := s.execRepo.Save(ctx, cur); err != nil {
-			return err
+			cur, err := s.execRepo.FindByID(ctx, record.ExecutionID)
+			if err != nil {
+				return err
+			}
+			if cur == nil {
+				return errs.NewExecutionNotFound(record.ExecutionID)
+			}
+			if err := cur.MarkAsDispatchFailed(); err != nil {
+				return err
+			}
+			if err := s.execRepo.Save(ctx, cur); err != nil {
+				return err
+			}
+			if s.outboxRepo == nil {
+				return nil
+			}
+			return s.outboxRepo.MarkDead(ctx, []int64{record.ExecutionID}, "", mqErr.Error())
 		}
 		if s.outboxRepo == nil {
 			return nil
-		}
-		if mqErr != nil {
-			return s.outboxRepo.MarkDead(ctx, []int64{record.ExecutionID}, "", mqErr.Error())
 		}
 		return s.outboxRepo.MarkPublished(ctx, []int64{record.ExecutionID}, "", time.Now())
 	}); err != nil {
@@ -407,6 +402,7 @@ func (s *DispatchAppService) dispatchOneBatch(
 	records, nameMap := s.domainSvc.CreateBatchRecordsForRequest(requestID, batch.Cases, v, user)
 
 	// 阶段一：批量插入执行记录和 Outbox，并回填主键。
+	var messages []*entity.OutboxMessage
 	if err := s.tx.Do(ctx, func(ctx context.Context) error {
 		if err := s.execRepo.BatchAdd(ctx, records); err != nil {
 			return err
@@ -415,7 +411,7 @@ func (s *DispatchAppService) dispatchOneBatch(
 			return nil
 		}
 		availableAt := time.Now().Add(s.cfg.OutboxFastPathGrace)
-		messages := make([]*entity.OutboxMessage, 0, len(records))
+		messages = make([]*entity.OutboxMessage, 0, len(records))
 		for _, record := range records {
 			messages = append(messages, entity.NewOutboxMessage(record, nameMap[record.CaseID], availableAt))
 		}
@@ -432,15 +428,14 @@ func (s *DispatchAppService) dispatchOneBatch(
 		})
 	}
 
-	// 阶段二：幂等重试复用已存在的记录。只有 INIT 记录需要发布；已经推进的
-	// 记录直接写入进度结果，不重复发送消息。
+	// 阶段二：幂等重试复用已存在的记录。Outbox 仍为 PENDING 时需要发布；
+	// PUBLISHED/PROCESSING/DEAD 直接回放结果，不重复发送消息。
 	// 调用方带着同一个 request_id 又来了一次（网络重试、超时重打等）。
-	// BatchAdd 因唯一键冲突回读已有记录，再按状态决定要不要重新发 MQ。
-	// 🚩一句话：是可重入的幂等；INIT 会再发，已终态则只回放结果。重复投递窗口要靠消费端幂等兜住。
-	// 网络断、客户端取消导致请求 ctx 取消、服务闪断后重启，只要调用方再用原来的 request_id，就能幂等重入。
+	// BatchAdd 因唯一键冲突回读已有记录和消息，再按出箱状态决定要不要重新发 MQ。
+	// 🚩一句话：是可重入的幂等；PENDING 会再发，已完成投递则只回放结果。重复投递窗口要靠消费端幂等兜住。
 	pendingRecords := make([]*entity.ExecutionRecord, 0, len(records))
 	result := vo.BatchResult{}
-	for _, record := range records {
+	for i, record := range records {
 		if record.Version != v {
 			return s.emitProgress(ctx, out, Progress{
 				ChunkIndex: batch.Index,
@@ -448,14 +443,19 @@ func (s *DispatchAppService) dispatchOneBatch(
 				ChunkError: "request_id was already used with a different version",
 			})
 		}
-		switch record.ExecutionStatus {
-		case vo.StatusInit:
-			pendingRecords = append(pendingRecords, record)
-		case vo.StatusFailed:
-			result.FailedIDs = append(result.FailedIDs, record.ExecutionID)
-		default:
-			result.SuccessIDs = append(result.SuccessIDs, record.ExecutionID)
+		var message *entity.OutboxMessage
+		if i < len(messages) {
+			message = messages[i]
 		}
+		if status, done := replayDispatchedStatus(message, record); done {
+			if status == vo.StatusDispatchFailed {
+				result.FailedIDs = append(result.FailedIDs, record.ExecutionID)
+			} else {
+				result.SuccessIDs = append(result.SuccessIDs, record.ExecutionID)
+			}
+			continue
+		}
+		pendingRecords = append(pendingRecords, record)
 	}
 
 	newResult := vo.BatchResult{}
@@ -482,8 +482,8 @@ func (s *DispatchAppService) dispatchOneBatch(
 	result.FailedIDs = append(result.FailedIDs, newResult.FailedIDs...)
 	result.ErrorMessage = newResult.ErrorMessage
 
-	// 阶段三：使用独立补偿上下文持久化新状态。客户端取消 RPC 时 MQ 可能已经
-	// 接收任务，继续使用已取消的请求上下文会使记录滞留在 INIT。
+	// 阶段三：使用独立补偿上下文持久化 Outbox 与失败记录。客户端取消 RPC 时
+	// MQ 可能已经接收任务，继续使用已取消的请求上下文会使消息滞留在 PENDING。
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	writeBackErr := s.tx.Do(writeCtx, func(ctx context.Context) error {
@@ -521,6 +521,23 @@ func (s *DispatchAppService) emitProgress(ctx context.Context, out chan<- Progre
 		return ctx.Err()
 	case out <- p:
 		return nil
+	}
+}
+
+// replayDispatchedStatus 判断幂等重试是否已经完成投递。有 Outbox 时以消息
+// 表为准；未启用 Outbox 时，DISPATCH_FAILED 视为下发失败，已经进入执行态的
+// 记录视为下发成功，其余情况继续走快速路径。
+func replayDispatchedStatus(message *entity.OutboxMessage, record *entity.ExecutionRecord) (vo.ExecutionStatus, bool) {
+	if message != nil {
+		return message.ReplayStatus()
+	}
+	switch record.ExecutionStatus {
+	case vo.StatusDispatchFailed:
+		return vo.StatusDispatchFailed, true
+	case vo.StatusFailed, vo.StatusRunning, vo.StatusSuccess:
+		return vo.StatusWait, true
+	default:
+		return "", false
 	}
 }
 

@@ -24,10 +24,10 @@ func TestNewExecutionNotFound(t *testing.T) {
 }
 
 func TestNewIllegalStatusTransition(t *testing.T) {
-	err := NewIllegalStatusTransition(7, "INIT", "RUNNING")
+	err := NewIllegalStatusTransition(7, "WAIT", "RUNNING")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrIllegalStatusTransition))
-	assert.True(t, strings.Contains(err.Error(), "INIT"))
+	assert.True(t, strings.Contains(err.Error(), "WAIT"))
 	assert.True(t, strings.Contains(err.Error(), "RUNNING"))
 }
 

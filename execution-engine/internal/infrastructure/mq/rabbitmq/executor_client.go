@@ -481,6 +481,8 @@ func (c *Client) release(pc *pooledChannel) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// fresh 是挂在 旧快照 conn 上的。若连接已换代或客户端已关，
+	// 把它放进池会变成废/错代 channel，所以关掉丢弃，让重连循环或关停路径自己处理池子。
 	if c.closed || c.conn != conn {
 		_ = fresh.ch.Close()
 		return
